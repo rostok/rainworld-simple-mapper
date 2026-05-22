@@ -12,6 +12,8 @@ python mapper.py --mod C:\path\to\mod\folder  # absolute path
 python mapper.py --mod 3033569804 --mod 9876  # multiple, left = higher priority
 python mapper.py --slugcat artificer          # different campaign-specific files
 python mapper.py --no-local-mods              # ignore StreamingAssets/mods/*
+python mapper.py --separate-layers            # also emit <region>_L<N>.svg per layer
+python mapper.py --filled                     # solid-block style instead of outline (default)
 ```
 
 Output: `out/<region>.svg` — open in a browser or convert with ImageMagick:
@@ -33,11 +35,22 @@ For each lookup, the first existing file wins. Within a layer, slugcat-suffixed 
 
 ## What's drawn
 
-- **Black rects** — solid / slope tiles (slope direction not distinguished)
-- **Grey thin rects** — `Floor` (platform-from-above) tiles
-- **Green lines** — room-to-room connections (centered on `mapPos`)
+Default style is **outline** (wireframe, mirrors `rain-world-map`'s look):
+
+- **Black 0.35-stroke lines** — boundary edges between solid and non-solid tiles (RLE'd per row/column)
+- **Black diagonal lines** — slope tiles, oriented by their two solid neighbors (per `generateGeoJSON.py:305–315`)
+- **Black shelf glyphs** — half-floors (`Floor` terrain): top + mid horizontals plus side stubs depending on whether the neighbor is solid or air
+- **Grey 0.4-stroke lines** — vertical / horizontal beams (climbable poles/bars) through tile centers
+- **`≡` glyphs** — shortcut entrances/exits (anchored at the tile coords from `Connection:` lines)
+- **Green lines** — room-to-room shortcut connections, anchored at the two `≡` endpoints
 - **Red labels** — uppercase room names at room centers
 - Cream background
+
+Pass `--filled` to revert to the older solid-block style (3-unit black rects for solid/slope, thin grey shelves for floors, beams as thin lines).
+
+Rooms are placed using `devPos` (the dev-editor layout, fields [2,3] of `map_<region>.txt`), matching `rain-world-map/generateGeoJSON.py:74` (`devPos*10` with 20 px/tile). devPos lays rooms out flat with no overlap; the in-game pause map's `canPos` (fields [0,1]) compresses rooms into stacked layers and is not used here. 1 tile = 2 devPos units; the room's `devPos` value is its lower-left corner.
+
+SVG draw order: cream background → per-layer geometry (`<g id="layer-N">`, all full opacity) → connection lines (`<g id="connections">`, on top of solids) → room labels (`<g id="labels">`, top of everything). Pass `--separate-layers` to additionally emit one `<region>_L<N>.svg` per `canLayer` — rarely needed with devPos.
 
 ## Format notes
 
