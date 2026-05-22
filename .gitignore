@@ -1,0 +1,20 @@
+# Generated maps (every per-mod / per-run output folder holds only these)
+*.svg
+/Bestowed2/
+
+# Python
+__pycache__/
+*.pyc
+
+# Baseline-merge cache built by mapdiff.py
+/.cache/
+
+# Local snapshots of the project
+*.7z
+
+# Editor / agent local state
+/.claude/
+
+# Scratch
+*.tmp.*
+cursave.txt
