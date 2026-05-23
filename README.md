@@ -10,11 +10,17 @@ python mapper.py --region su                  # one region
 python mapper.py --mod 1234567890             # different workshop id
 python mapper.py --mod C:\path\to\mod\folder  # absolute path
 python mapper.py --mod 3033569804 --mod 9876  # multiple, left = higher priority
+python mapper.py --game D:\Games\RainWorld    # non-Steam or non-default install path
 python mapper.py --slugcat artificer          # different campaign-specific files
 python mapper.py --no-local-mods              # ignore StreamingAssets/mods/*
 python mapper.py --separate-layers            # also emit <region>_L<N>.svg per layer
-python mapper.py --filled                     # solid-block style instead of outline (default)
+python mapper.py --outline                    # cream-bg wireframe style instead of the default filled style
+python mapper.py --invert                     # invert every colour in the palette
+python mapper.py --no-optimize                # one rect per solid-tile row (legacy output) instead of merged paths
+python mapper.py --name-from-modinfo          # show "The Champion" instead of "3033569804" in source tags
 ```
+
+`--game` points at the Rain World install root (the folder that contains `RainWorld_Data/`). The vanilla world path and the workshop content path (`<steamapps>/workshop/content/312520`) are both derived from it. Use `--vanilla` or `--workshop` to override either independently.
 
 Output: `out/<region>.svg` — open in a browser or convert with ImageMagick:
 
@@ -33,20 +39,45 @@ For each lookup, the first existing file wins. Within a layer, slugcat-suffixed 
 
 `world_<region>.txt` is **merged** across all layers (mod `[MERGE]` semantics): every layer's `ROOMS` section contributes connection pairs.
 
+## Console output
+
+Each region line is prefixed with a source tag derived from which layers actually contributed files for that region:
+
+- `vanilla` — every file came from `StreamingAssets/world`.
+- `MOD[<a>]` — that mod fully replaced the region; nothing fell through to vanilla.
+- `MOD[<a>+<b>+vanilla]` — multiple sources contributed. Non-vanilla layers are listed first so they stand out at a glance. `<a>/modify` indicates the per-mod `modify/world` overlay layer.
+
+Source labels default to the workshop ID (or local mod folder name). Pass `--name-from-modinfo` to read the `name` field from each mod's `modinfo.json` instead — e.g. `3033569804` becomes `The Champion`. Falls back to the folder name when `modinfo.json` is missing or malformed.
+
+## Output optimization
+
+By default the filled style merges every solid + slope tile in a connected component into a single `<path>` per room — no per-row rects, no seams between adjacent fills. Cuts the SVG output roughly in half (≈71 MB → ≈37 MB across all regions) and eliminates the anti-alias hairlines that used to leak through between adjacent rects.
+
+Pass `--no-optimize` to fall back to the legacy per-row-rect emit (one `<rect>` per solid run, with a 0.02-unit overlap and `shape-rendering="crispEdges"` to hide seams). Outline style is unchanged either way — its output is line-based, not rect-based.
+
 ## What's drawn
 
-Default style is **outline** (wireframe, mirrors `rain-world-map`'s look):
+Default style is **filled** (card-and-fills):
+
+- **Dark background** (`#1a1a1a`) — same colour as solids, so solid masses appear to bleed off room edges.
+- **White card per room** — a `room_bg` rect at each room's lower-left corner, sized `(w × h × TILE_UNITS)`.
+- **Solids** — dark filled rects (RLE per row) on top of the room card.
+- **Slopes** — dark triangles (`<polygon>`) oriented by the two solid neighbours, so only the diagonal hypotenuse cuts into the white card; the right-angle sides abut adjacent solid rects and visually merge with them.
+- **Half-floors** — thin dark shelves at the top of the tile.
+- **Beams** — mid-grey thin lines through tile centres.
+- **Connections** — gold (`#ffd700`) dotted lines (`stroke-dasharray="1.2 1.2"`), anchored at `≡` glyphs; contrasts both the dark outer bg and the white room cards.
+- **Red labels** — uppercase room names at room centers.
+
+Pass `--outline` for the wireframe style (mirrors `rain-world-map`'s look):
 
 - **Black 0.35-stroke lines** — boundary edges between solid and non-solid tiles (RLE'd per row/column)
-- **Black diagonal lines** — slope tiles, oriented by their two solid neighbors (per `generateGeoJSON.py:305–315`)
-- **Black shelf glyphs** — half-floors (`Floor` terrain): top + mid horizontals plus side stubs depending on whether the neighbor is solid or air
-- **Grey 0.4-stroke lines** — vertical / horizontal beams (climbable poles/bars) through tile centers
-- **`≡` glyphs** — shortcut entrances/exits (anchored at the tile coords from `Connection:` lines)
-- **Green lines** — room-to-room shortcut connections, anchored at the two `≡` endpoints
-- **Red labels** — uppercase room names at room centers
+- **Black diagonal lines** — slope tiles, oriented by their two solid neighbours (per `generateGeoJSON.py:305–315`)
+- **Black shelf glyphs** — half-floors: top + mid horizontals plus side stubs
+- **Grey lines** — vertical / horizontal beams through tile centres
+- **Green lines** — connections, anchored at `≡` glyphs
 - Cream background
 
-Pass `--filled` to revert to the older solid-block style (3-unit black rects for solid/slope, thin grey shelves for floors, beams as thin lines).
+Pass `--invert` (compatible with either style) to invert every hex colour in the palette.
 
 Rooms are placed using `devPos` (the dev-editor layout, fields [2,3] of `map_<region>.txt`), matching `rain-world-map/generateGeoJSON.py:74` (`devPos*10` with 20 px/tile). devPos lays rooms out flat with no overlap; the in-game pause map's `canPos` (fields [0,1]) compresses rooms into stacked layers and is not used here. 1 tile = 2 devPos units; the room's `devPos` value is its lower-left corner.
 

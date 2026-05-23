@@ -11,27 +11,96 @@ Format references (from C:/projects/rainworld/quicksave-mod/game-source):
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
-VANILLA_DEFAULT = r"C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\StreamingAssets"
-WORKSHOP_DEFAULT = r"C:\Program Files (x86)\Steam\steamapps\workshop\content\312520"
+GAME_DEFAULT = r"C:\Program Files (x86)\Steam\steamapps\common\Rain World"
+
+
+def vanilla_for(game_root):
+    return os.path.join(game_root, "RainWorld_Data", "StreamingAssets")
+
+
+def workshop_for(game_root):
+    # Steam: <steamapps>/common/Rain World → <steamapps>/workshop/content/312520
+    return os.path.normpath(os.path.join(
+        game_root, "..", "..", "workshop", "content", "312520"
+    ))
 
 T_AIR, T_SOLID, T_SLOPE, T_FLOOR, T_SHORTCUT = 0, 1, 2, 3, 4
 # devPos units per tile = 2, matching generateGeoJSON.py:74 (`devPos*10` with
 # 20 px per tile). devPos is the dev-editor placement — rooms tile naturally.
 TILE_UNITS = 2.0
 
+PALETTES = {
+    "filled": {
+        "bg": "#1a1a1a",
+        "room_bg": "#ffffff",
+        "solid": "#1a1a1a",
+        "floor": "#1a1a1a",
+        "beam": "#666666",
+        "conn": "#ffd700",
+        "conn_dash": "1.2 1.2",
+        "mark": "#cccccc",
+        "label": "#e63946",
+    },
+    "outline": {
+        "bg": "#f6f1e7",
+        "room_bg": None,
+        "solid": "#000000",
+        "floor": "#000000",
+        "beam": "#777777",
+        "conn": "#27ae60",
+        "conn_dash": None,
+        "mark": "#1f4e79",
+        "label": "#c0392b",
+    },
+}
 
-def resolve_mod(arg):
+
+def _invert_hex(c):
+    if c is None or not c.startswith("#") or len(c) != 7:
+        return c
+    r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+    return f"#{255 - r:02x}{255 - g:02x}{255 - b:02x}"
+
+
+def invert_palette(p):
+    return {k: (_invert_hex(v) if isinstance(v, str) and v.startswith("#") else v)
+            for k, v in p.items()}
+
+
+def _load_mod_name(mod_root, fallback):
+    """Read the `name` field from `<mod_root>/modinfo.json` and return it.
+    Falls back to `fallback` on any failure (missing file, parse error,
+    missing/empty field). Tolerates trailing commas — several shipped
+    modinfo.json files include them, which the stdlib json parser rejects."""
+    p = os.path.join(mod_root, "modinfo.json")
+    if not os.path.isfile(p):
+        return fallback
+    try:
+        with open(p, "r", encoding="utf-8-sig", errors="replace") as f:
+            txt = f.read()
+        txt = re.sub(r",(\s*[}\]])", r"\1", txt)
+        data = json.loads(txt)
+        name = data.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except Exception:
+        pass
+    return fallback
+
+
+def resolve_mod(arg, workshop_root):
     if os.path.isabs(arg) and os.path.isdir(arg):
         return arg
-    p = os.path.join(WORKSHOP_DEFAULT, arg)
+    p = os.path.join(workshop_root, arg)
     if os.path.isdir(p):
         return p
-    raise SystemExit(f"mod not found: {arg}")
+    raise SystemExit(f"mod not found: {arg} (searched {workshop_root})")
 
 
 class Resolver:
@@ -39,12 +108,19 @@ class Resolver:
     per-mod world, then vanilla world. Within a layer, slugcat-suffixed
     variants (e.g. `map_oe-thechampion.txt`) win over the plain name."""
 
-    def __init__(self, mod_roots, vanilla_root, slugcat=None):
+    def __init__(self, mod_roots, vanilla_root, slugcat=None,
+                 name_from_modinfo=False):
         self.layers = []
+        self.labels = []   # parallel to self.layers; short tag for console output
         for m in mod_roots:
+            base = os.path.basename(os.path.normpath(m))
+            name = _load_mod_name(m, base) if name_from_modinfo else base
             self.layers.append(os.path.join(m, "modify", "world"))
+            self.labels.append(f"{name}/modify")
             self.layers.append(os.path.join(m, "world"))
+            self.labels.append(name)
         self.layers.append(os.path.join(vanilla_root, "world"))
+        self.labels.append("vanilla")
         self.slugcat = slugcat
 
     def _variants(self, fname):
@@ -54,21 +130,21 @@ class Resolver:
         return [f"{base}-{self.slugcat}{ext}", fname]
 
     def region_file(self, region, fname):
-        for layer in self.layers:
+        for label, layer in zip(self.labels, self.layers):
             for v in self._variants(fname):
                 p = os.path.join(layer, region, v)
                 if os.path.isfile(p):
-                    return p
-        return None
+                    return p, label
+        return None, None
 
     def room_file(self, region, room_name):
-        for layer in self.layers:
+        for label, layer in zip(self.labels, self.layers):
             for v in self._variants(room_name.lower() + ".txt"):
                 for sub in (f"{region}-rooms", "gates", "gate shelters"):
                     p = os.path.join(layer, sub, v)
                     if os.path.isfile(p):
-                        return p
-        return None
+                        return p, label
+        return None, None
 
     def regions(self):
         codes = set()
@@ -198,19 +274,38 @@ def _svg_y(ll_y, ty_grid):
     return -(ll_y + ty_grid * TILE_UNITS)
 
 
-def _emit_filled(out, tiles, ll_x, ll_y):
-    """Filled style: solid 3-unit black rects (RLE per row), platform shelves,
-    beams as thin lines through tile centers."""
-    by_row = {}
+def _emit_filled(out, tiles, ll_x, ll_y, palette):
+    """Filled style: rect runs for solid; triangles for slopes (only the
+    diagonal is exposed — the right-angle sides abut solid neighbors and
+    blend with them); thin shelves for floors; beams as lines.
+
+    Each rect is grown by `eps` on every side so the renderer's anti-alias
+    seams sit inside the next shape rather than on its boundary. crispEdges
+    on the geometry <g> is the primary defence; this is belt-and-braces.
+    """
+    eps = 0.02
+    solid_color = palette["solid"]
+    floor_color = palette["floor"]
+    solid_by_row = {}    # ty -> list[x]  (T_SOLID only)
+    floor_by_row = {}    # ty -> list[x]  (T_FLOOR)
+    slope_tiles = []     # (x, y) needing neighbor lookup
+    solid_set = set()
     beams = []
-    for tx, ty, terrain, vbeam, hbeam in tiles:
-        if terrain in (T_SOLID, T_SLOPE, T_FLOOR):
-            by_row.setdefault((ty, terrain), []).append(tx)
-        if vbeam or hbeam:
-            beams.append((tx, ty, vbeam, hbeam))
-    for (ty, terrain), xs in by_row.items():
+    for tx, ty, terrain, vb, hb in tiles:
+        if terrain == T_SOLID:
+            solid_by_row.setdefault(ty, []).append(tx)
+            solid_set.add((tx, ty))
+        elif terrain == T_SLOPE:
+            slope_tiles.append((tx, ty))
+        elif terrain == T_FLOOR:
+            floor_by_row.setdefault(ty, []).append(tx)
+        if vb or hb:
+            beams.append((tx, ty, vb, hb))
+
+    for ty, xs in solid_by_row.items():
         xs.sort()
-        runs, start, prev = [], xs[0], xs[0]
+        start = prev = xs[0]
+        runs = []
         for v in xs[1:]:
             if v == prev + 1:
                 prev = v
@@ -221,21 +316,239 @@ def _emit_filled(out, tiles, ll_x, ll_y):
         for sx, ex in runs:
             px = ll_x + sx * TILE_UNITS
             run_w = (ex - sx + 1) * TILE_UNITS
-            if terrain == T_FLOOR:
-                out.append(
-                    f'<rect x="{px:.2f}" y="{y_top:.2f}" '
-                    f'width="{run_w:.2f}" height="1" fill="#555"/>'
-                )
+            out.append(
+                f'<rect x="{px - eps:.3f}" y="{y_top - eps:.3f}" '
+                f'width="{run_w + 2 * eps:.3f}" '
+                f'height="{TILE_UNITS + 2 * eps:.3f}" '
+                f'fill="{solid_color}"/>'
+            )
+
+    for ty, xs in floor_by_row.items():
+        xs.sort()
+        start = prev = xs[0]
+        runs = []
+        for v in xs[1:]:
+            if v == prev + 1:
+                prev = v
             else:
-                out.append(
-                    f'<rect x="{px:.2f}" y="{y_top:.2f}" '
-                    f'width="{run_w:.2f}" height="{TILE_UNITS:.2f}" fill="#000"/>'
-                )
+                runs.append((start, prev)); start = prev = v
+        runs.append((start, prev))
+        y_top = _svg_y(ll_y, ty + 1)
+        for sx, ex in runs:
+            px = ll_x + sx * TILE_UNITS
+            run_w = (ex - sx + 1) * TILE_UNITS
+            out.append(
+                f'<rect x="{px - eps:.3f}" y="{y_top - eps:.3f}" '
+                f'width="{run_w + 2 * eps:.3f}" '
+                f'height="{0.6 + 2 * eps:.3f}" fill="{floor_color}"/>'
+            )
+
+    for x, y in slope_tiles:
+        L = (x - 1, y) in solid_set
+        R = (x + 1, y) in solid_set
+        D = (x, y - 1) in solid_set
+        U = (x, y + 1) in solid_set
+        tl_x = ll_x + x * TILE_UNITS
+        tr_x = tl_x + TILE_UNITS
+        y_top = _svg_y(ll_y, y + 1)
+        y_bot = _svg_y(ll_y, y)
+        # solid_corner names refer to where the solid mass sits inside the tile
+        if L and D:
+            pts = f"{tl_x:.2f},{y_top:.2f} {tl_x:.2f},{y_bot:.2f} {tr_x:.2f},{y_bot:.2f}"
+        elif L and U:
+            pts = f"{tl_x:.2f},{y_top:.2f} {tl_x:.2f},{y_bot:.2f} {tr_x:.2f},{y_top:.2f}"
+        elif R and D:
+            pts = f"{tl_x:.2f},{y_bot:.2f} {tr_x:.2f},{y_bot:.2f} {tr_x:.2f},{y_top:.2f}"
+        elif R and U:
+            pts = f"{tl_x:.2f},{y_top:.2f} {tr_x:.2f},{y_top:.2f} {tr_x:.2f},{y_bot:.2f}"
+        else:
+            # Ambiguous (isolated / 0 or 3+ neighbors) — fall back to full square.
+            pts = (f"{tl_x:.2f},{y_top:.2f} {tr_x:.2f},{y_top:.2f} "
+                   f"{tr_x:.2f},{y_bot:.2f} {tl_x:.2f},{y_bot:.2f}")
+        out.append(f'<polygon points="{pts}" fill="{solid_color}"/>')
+
     for tx, ty, vb, hb in beams:
-        _emit_beams(out, ll_x, ll_y, tx, ty, vb, hb)
+        _emit_beams(out, ll_x, ll_y, tx, ty, vb, hb, palette["beam"])
 
 
-def _emit_beams(out, ll_x, ll_y, tx, ty, vb, hb):
+# ── Edge offsets for boundary extraction (math coords, CCW around tile) ──
+# Each entry: (dx, dy, my_side, n_side, start_corner, end_corner)
+# A cell at (x,y) emits the edge for `my_side` when the neighbor at (x+dx,y+dy)
+# does not also cover `n_side` (the shared edge). Corners are (gx,gy) offsets
+# added to (x,y).
+_EDGE_DIRS = (
+    (0, -1, "D", "U", (0, 0), (1, 0)),  # bottom: BL → BR
+    (1,  0, "R", "L", (1, 0), (1, 1)),  # right:  BR → TR
+    (0,  1, "U", "D", (1, 1), (0, 1)),  # top:    TR → TL
+    (-1, 0, "L", "R", (0, 1), (0, 0)),  # left:   TL → BL
+)
+
+
+def _cell_covers(cells, pos, side):
+    """True if cells[pos] occupies the given side of its tile.
+    'S' = full solid (covers all sides); slope codes 'LD'/'LU'/'RD'/'RU'
+    cover the two sides whose letters they contain."""
+    kind = cells.get(pos)
+    if kind is None:
+        return False
+    if kind == "S":
+        return True
+    return side in kind
+
+
+def _build_solid_edges(cells):
+    """Return list of (start_pt, end_pt) boundary edges for the union of
+    solid + slope tiles. Shared edges between cells in the set cancel out."""
+    edges = []
+    for (x, y), kind in cells.items():
+        sides = ("D", "R", "U", "L") if kind == "S" else tuple(kind)
+        for dx, dy, my_side, n_side, s_off, e_off in _EDGE_DIRS:
+            if my_side not in sides:
+                continue
+            if _cell_covers(cells, (x + dx, y + dy), n_side):
+                continue
+            sp = (x + s_off[0], y + s_off[1])
+            ep = (x + e_off[0], y + e_off[1])
+            edges.append((sp, ep))
+        # Slope hypotenuse: always emitted (interior to the tile).
+        if kind == "LD":
+            edges.append(((x + 1, y), (x, y + 1)))      # BR → TL
+        elif kind == "LU":
+            edges.append(((x, y), (x + 1, y + 1)))      # BL → TR
+        elif kind == "RD":
+            edges.append(((x + 1, y + 1), (x, y)))      # TR → BL
+        elif kind == "RU":
+            edges.append(((x, y + 1), (x + 1, y)))      # TL → BR
+    return edges
+
+
+def _chain_loops(edges):
+    """Chain directed edges into closed loops. Each vertex has equal in/out
+    degree (guaranteed by the cancellation rule), so a greedy walk closes."""
+    from collections import defaultdict
+    adj = defaultdict(list)
+    for s, e in edges:
+        adj[s].append(e)
+    loops = []
+    while adj:
+        start_v = next(iter(adj))
+        pt = start_v
+        loop = [pt]
+        while True:
+            if pt not in adj or not adj[pt]:
+                break
+            nxt = adj[pt].pop()
+            if not adj[pt]:
+                del adj[pt]
+            if nxt == start_v:
+                break
+            loop.append(nxt)
+            pt = nxt
+        loops.append(loop)
+    return loops
+
+
+def _simplify_loop(loop):
+    """Drop vertices that lie on a straight line with their two neighbours."""
+    n = len(loop)
+    if n < 3:
+        return loop
+    out = []
+    for i in range(n):
+        prev = loop[(i - 1) % n]
+        p = loop[i]
+        nxt = loop[(i + 1) % n]
+        dx1 = p[0] - prev[0]; dy1 = p[1] - prev[1]
+        dx2 = nxt[0] - p[0];  dy2 = nxt[1] - p[1]
+        # collinear and same direction → interior of a straight run, drop it
+        if dx1 * dy2 - dy1 * dx2 == 0 and (dx1 * dx2 + dy1 * dy2) > 0:
+            continue
+        out.append(p)
+    return out
+
+
+def _loops_to_path_d(loops, ll_x, ll_y):
+    parts = []
+    for loop in loops:
+        simp = _simplify_loop(loop)
+        if len(simp) < 3:
+            continue
+        cmds = []
+        for i, (gx, gy) in enumerate(simp):
+            sx = ll_x + gx * TILE_UNITS
+            sy = -(ll_y + gy * TILE_UNITS)
+            cmds.append((f"M{sx:.2f},{sy:.2f}" if i == 0
+                         else f"L{sx:.2f},{sy:.2f}"))
+        cmds.append("Z")
+        parts.append("".join(cmds))
+    return "".join(parts)
+
+
+def _emit_filled_optimized(out, tiles, ll_x, ll_y, palette):
+    """Optimized filled emit: solid + slope tiles are merged into a single
+    `<path>` per connected component (no per-row rects, no eps padding).
+    Floors stay as RLE rects bundled into one path; beams unchanged."""
+    solid_color = palette["solid"]
+    floor_color = palette["floor"]
+    beam_color = palette["beam"]
+
+    solid_set = set()
+    slope_raw = []   # (x, y) — orientation decided after solid_set is known
+    floor_by_row = {}
+    beams = []
+    for tx, ty, terrain, vb, hb in tiles:
+        if terrain == T_SOLID:
+            solid_set.add((tx, ty))
+        elif terrain == T_SLOPE:
+            slope_raw.append((tx, ty))
+        elif terrain == T_FLOOR:
+            floor_by_row.setdefault(ty, []).append(tx)
+        if vb or hb:
+            beams.append((tx, ty, vb, hb))
+
+    cells = {pos: "S" for pos in solid_set}
+    for x, y in slope_raw:
+        L = (x - 1, y) in solid_set
+        R = (x + 1, y) in solid_set
+        D = (x, y - 1) in solid_set
+        U = (x, y + 1) in solid_set
+        if L and D:    cells[(x, y)] = "LD"
+        elif L and U:  cells[(x, y)] = "LU"
+        elif R and D:  cells[(x, y)] = "RD"
+        elif R and U:  cells[(x, y)] = "RU"
+        else:          cells[(x, y)] = "S"  # ambiguous → full square (matches legacy)
+
+    if cells:
+        d = _loops_to_path_d(_chain_loops(_build_solid_edges(cells)), ll_x, ll_y)
+        if d:
+            out.append(f'<path d="{d}" fill="{solid_color}"/>')
+
+    floor_parts = []
+    for ty, xs in floor_by_row.items():
+        xs.sort()
+        start = prev = xs[0]
+        runs = []
+        for v in xs[1:]:
+            if v == prev + 1:
+                prev = v
+            else:
+                runs.append((start, prev)); start = prev = v
+        runs.append((start, prev))
+        y_top = _svg_y(ll_y, ty + 1)
+        for sx, ex in runs:
+            px = ll_x + sx * TILE_UNITS
+            run_w = (ex - sx + 1) * TILE_UNITS
+            floor_parts.append(
+                f"M{px:.2f},{y_top:.2f}h{run_w:.2f}v0.6h-{run_w:.2f}Z"
+            )
+    if floor_parts:
+        out.append(f'<path d="{"".join(floor_parts)}" fill="{floor_color}"/>')
+
+    for tx, ty, vb, hb in beams:
+        _emit_beams(out, ll_x, ll_y, tx, ty, vb, hb, beam_color)
+
+
+def _emit_beams(out, ll_x, ll_y, tx, ty, vb, hb, color):
     tile_l = ll_x + tx * TILE_UNITS
     tile_r = tile_l + TILE_UNITS
     y_top = _svg_y(ll_y, ty + 1)
@@ -246,20 +559,22 @@ def _emit_beams(out, ll_x, ll_y, tx, ty, vb, hb):
         out.append(
             f'<line x1="{mid_x:.2f}" y1="{y_top:.2f}" '
             f'x2="{mid_x:.2f}" y2="{y_bot:.2f}" '
-            f'stroke="#777" stroke-width="0.4"/>'
+            f'stroke="{color}" stroke-width="0.4"/>'
         )
     if hb:
         out.append(
             f'<line x1="{tile_l:.2f}" y1="{mid_y:.2f}" '
             f'x2="{tile_r:.2f}" y2="{mid_y:.2f}" '
-            f'stroke="#777" stroke-width="0.4"/>'
+            f'stroke="{color}" stroke-width="0.4"/>'
         )
 
 
-def _emit_outline(out, tiles, ll_x, ll_y):
-    """Outline style: black 1-tile-wide boundary lines between solid and
-    non-solid tiles (RLE'd), slope tiles as diagonals oriented by their two
-    solid neighbors, half-floors as a shelf with side stubs, plus beams."""
+def _emit_outline(out, tiles, ll_x, ll_y, palette):
+    """Outline style: 1-tile-wide boundary lines between solid and non-solid
+    tiles (RLE'd), slope tiles as diagonals oriented by their two solid
+    neighbors, half-floors as a shelf with side stubs, plus beams."""
+    edge_color = palette["solid"]
+    beam_color = palette["beam"]
     by_pos = {}  # (x, y) -> (terrain, vb, hb)
     solid = set()
     for tx, ty, terrain, vb, hb in tiles:
@@ -289,9 +604,9 @@ def _emit_outline(out, tiles, ll_x, ll_y):
             if v == prev + 1:
                 prev = v
             else:
-                _emit_h_edge(out, ll_x, ll_y, start, prev + 1, yg)
+                _emit_h_edge(out, ll_x, ll_y, start, prev + 1, yg, edge_color)
                 start = prev = v
-        _emit_h_edge(out, ll_x, ll_y, start, prev + 1, yg)
+        _emit_h_edge(out, ll_x, ll_y, start, prev + 1, yg, edge_color)
 
     for xg, ys in v_edges.items():
         ys.sort()
@@ -300,9 +615,9 @@ def _emit_outline(out, tiles, ll_x, ll_y):
             if v == prev + 1:
                 prev = v
             else:
-                _emit_v_edge(out, ll_x, ll_y, xg, start, prev + 1)
+                _emit_v_edge(out, ll_x, ll_y, xg, start, prev + 1, edge_color)
                 start = prev = v
-        _emit_v_edge(out, ll_x, ll_y, xg, start, prev + 1)
+        _emit_v_edge(out, ll_x, ll_y, xg, start, prev + 1, edge_color)
 
     # Slopes: pick diagonal from the pair of solid neighbors (per
     # generateGeoJSON.py:305-315).
@@ -321,13 +636,13 @@ def _emit_outline(out, tiles, ll_x, ll_y):
         if L and D:
             # solid in lower-left → diagonal TL→BR (`\` in screen-space, since
             # screen y grows downward we draw (tl_x,y_top)→(tr_x,y_bot))
-            _emit_seg(out, tl_x, y_top, tr_x, y_bot)
+            _emit_seg(out, tl_x, y_top, tr_x, y_bot, edge_color)
         elif L and U:
-            _emit_seg(out, tl_x, y_bot, tr_x, y_top)
+            _emit_seg(out, tl_x, y_bot, tr_x, y_top, edge_color)
         elif R and D:
-            _emit_seg(out, tl_x, y_bot, tr_x, y_top)
+            _emit_seg(out, tl_x, y_bot, tr_x, y_top, edge_color)
         elif R and U:
-            _emit_seg(out, tl_x, y_top, tr_x, y_bot)
+            _emit_seg(out, tl_x, y_top, tr_x, y_bot, edge_color)
 
     # Half-floors: top shelf line; bottom shelf at mid-tile unless hbeam
     # shares it; small side stubs.
@@ -340,62 +655,63 @@ def _emit_outline(out, tiles, ll_x, ll_y):
         y_mid = _svg_y(ll_y, y + 0.5)
         y_bot = _svg_y(ll_y, y)
         # top of shelf
-        _emit_seg(out, tile_l, y_top, tile_r, y_top)
+        _emit_seg(out, tile_l, y_top, tile_r, y_top, edge_color)
         # mid-line (skipped if hbeam, since that line would coincide)
         if not hb:
-            _emit_seg(out, tile_l, y_mid, tile_r, y_mid)
+            _emit_seg(out, tile_l, y_mid, tile_r, y_mid, edge_color)
         # left stub
         left = by_pos.get((x - 1, y), (T_AIR, False, False))[0]
         if left == T_SOLID:
-            _emit_seg(out, tile_l, y_bot, tile_l, y_mid)
+            _emit_seg(out, tile_l, y_bot, tile_l, y_mid, edge_color)
         else:
-            _emit_seg(out, tile_l, y_mid, tile_l, y_top)
+            _emit_seg(out, tile_l, y_mid, tile_l, y_top, edge_color)
         # right stub
         right = by_pos.get((x + 1, y), (T_AIR, False, False))[0]
         if right == T_SOLID:
-            _emit_seg(out, tile_r, y_bot, tile_r, y_mid)
+            _emit_seg(out, tile_r, y_bot, tile_r, y_mid, edge_color)
         else:
-            _emit_seg(out, tile_r, y_mid, tile_r, y_top)
+            _emit_seg(out, tile_r, y_mid, tile_r, y_top, edge_color)
 
     # Beams
     for (x, y), (terrain, vb, hb) in by_pos.items():
         if vb or hb:
-            _emit_beams(out, ll_x, ll_y, x, y, vb, hb)
+            _emit_beams(out, ll_x, ll_y, x, y, vb, hb, beam_color)
 
 
-def _emit_h_edge(out, ll_x, ll_y, x_start, x_end, y_grid):
+def _emit_h_edge(out, ll_x, ll_y, x_start, x_end, y_grid, color):
     x1 = ll_x + x_start * TILE_UNITS
     x2 = ll_x + x_end * TILE_UNITS
     yy = _svg_y(ll_y, y_grid)
     out.append(
         f'<line x1="{x1:.2f}" y1="{yy:.2f}" x2="{x2:.2f}" y2="{yy:.2f}" '
-        f'stroke="#000" stroke-width="0.35"/>'
+        f'stroke="{color}" stroke-width="0.35"/>'
     )
 
 
-def _emit_v_edge(out, ll_x, ll_y, x_grid, y_start, y_end):
+def _emit_v_edge(out, ll_x, ll_y, x_grid, y_start, y_end, color):
     xx = ll_x + x_grid * TILE_UNITS
     y1 = _svg_y(ll_y, y_start)
     y2 = _svg_y(ll_y, y_end)
     out.append(
         f'<line x1="{xx:.2f}" y1="{y1:.2f}" x2="{xx:.2f}" y2="{y2:.2f}" '
-        f'stroke="#000" stroke-width="0.35"/>'
+        f'stroke="{color}" stroke-width="0.35"/>'
     )
 
 
-def _emit_seg(out, x1, y1, x2, y2):
+def _emit_seg(out, x1, y1, x2, y2, color):
     out.append(
         f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
-        f'stroke="#000" stroke-width="0.35"/>'
+        f'stroke="{color}" stroke-width="0.35"/>'
     )
 
 
 def render_region(resolver, region, out_dir):
-    map_path = resolver.region_file(region, f"map_{region}.txt")
+    map_path, map_src = resolver.region_file(region, f"map_{region}.txt")
     if not map_path:
         return region, "skip (no map_*.txt)"
 
     rooms_map, conn_entries = parse_map_file(map_path)
+    sources = {map_src}
 
     # Cache geometry-derived per-room data we need below.
     room_data = {}  # name -> (w, h, ll_x, ll_y, tiles, layer)
@@ -403,9 +719,10 @@ def render_region(resolver, region, out_dir):
     max_x = max_y = float("-inf")
 
     for name, (dx, dy, layer, _sub) in rooms_map.items():
-        room_path = resolver.room_file(region, name)
+        room_path, room_src = resolver.room_file(region, name)
         if not room_path:
             continue
+        sources.add(room_src)
         geo = parse_room_geometry(room_path)
         if not geo:
             continue
@@ -444,22 +761,37 @@ def render_region(resolver, region, out_dir):
     layer_geo = {}      # layer -> list[str]
     layer_labels = {}   # layer -> list[str]
     style = getattr(resolver, "style", "outline")
+    palette = getattr(resolver, "palette", PALETTES[style])
+    label_color = palette["label"]
+    room_bg = palette.get("room_bg")
 
     for name, (w, h, ll_x, ll_y, tiles, layer, cx, cy) in room_data.items():
         rects = layer_geo.setdefault(layer, [])
+        if room_bg:
+            rects.append(
+                f'<rect x="{ll_x:.2f}" y="{_svg_y(ll_y, h):.2f}" '
+                f'width="{w * TILE_UNITS:.2f}" '
+                f'height="{h * TILE_UNITS:.2f}" '
+                f'fill="{room_bg}"/>'
+            )
         if style == "filled":
-            _emit_filled(rects, tiles, ll_x, ll_y)
+            if getattr(resolver, "optimize", True):
+                _emit_filled_optimized(rects, tiles, ll_x, ll_y, palette)
+            else:
+                _emit_filled(rects, tiles, ll_x, ll_y, palette)
         else:
-            _emit_outline(rects, tiles, ll_x, ll_y)
+            _emit_outline(rects, tiles, ll_x, ll_y, palette)
         layer_labels.setdefault(layer, []).append(
             f'<text x="{cx:.1f}" y="{(-cy):.1f}" font-size="6" '
-            f'fill="#c0392b" text-anchor="middle" '
+            f'fill="{label_color}" text-anchor="middle" '
             f'font-family="monospace">{name}</text>'
         )
 
     # ── Build connection lines anchored at shortcut tiles, plus `≡` glyphs ─
-    # Marks live on the layer of the room they attach to (so they dim with it).
-    # Connection lines are kept layer-agnostic and drawn on top of all geometry.
+    mark_color = palette["mark"]
+    conn_color = palette["conn"]
+    conn_dash = palette.get("conn_dash")
+    dash_attr = f' stroke-dasharray="{conn_dash}"' if conn_dash else ""
     layer_marks = {}        # layer -> list[str] (≡ symbols)
     connections = []        # list[(line_str, {layer_a, layer_b})]
     for (a, b, ax, ay, bx, by, _da, _db) in conn_entries:
@@ -472,7 +804,7 @@ def render_region(resolver, region, out_dir):
             wax, way = tile_to_world(a, ax, ay)
             layer_marks.setdefault(la, []).append(
                 f'<text x="{wax:.2f}" y="{(-way + 2.0):.2f}" font-size="6" '
-                f'text-anchor="middle" fill="#1f4e79" '
+                f'text-anchor="middle" fill="{mark_color}" '
                 f'font-family="monospace">≡</text>'
             )
         if in_b:
@@ -480,14 +812,15 @@ def render_region(resolver, region, out_dir):
             wbx, wby = tile_to_world(b, bx, by)
             layer_marks.setdefault(lb, []).append(
                 f'<text x="{wbx:.2f}" y="{(-wby + 2.0):.2f}" font-size="6" '
-                f'text-anchor="middle" fill="#1f4e79" '
+                f'text-anchor="middle" fill="{mark_color}" '
                 f'font-family="monospace">≡</text>'
             )
         if in_a and in_b:
             line = (
                 f'<line x1="{wax:.2f}" y1="{(-way):.2f}" '
                 f'x2="{wbx:.2f}" y2="{(-wby):.2f}" '
-                f'stroke="#27ae60" stroke-width="0.8" opacity="0.85"/>'
+                f'stroke="{conn_color}" stroke-width="0.8" '
+                f'opacity="0.9"{dash_attr}/>'
             )
             connections.append((line, {room_data[a][5], room_data[b][5]}))
 
@@ -499,7 +832,7 @@ def render_region(resolver, region, out_dir):
     viewbox = f"{vb_x:.1f} {vb_y:.1f} {vb_w:.1f} {vb_h:.1f}"
     bg_rect = (
         f'<rect x="{vb_x:.1f}" y="{vb_y:.1f}" width="{vb_w:.1f}" '
-        f'height="{vb_h:.1f}" fill="#f6f1e7"/>'
+        f'height="{vb_h:.1f}" fill="{palette["bg"]}"/>'
     )
 
     all_layers = sorted(set(list(layer_geo) + list(layer_marks) + list(layer_labels)))
@@ -514,7 +847,9 @@ def render_region(resolver, region, out_dir):
             f.write(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{viewbox}">\n')
             f.write(bg_rect + "\n")
             for layer in render_layers:
-                f.write(f'<g id="layer-{layer}">\n')
+                f.write(
+                    f'<g id="layer-{layer}" shape-rendering="crispEdges">\n'
+                )
                 for chunk in (layer_geo.get(layer, []),
                               layer_marks.get(layer, [])):
                     if chunk:
@@ -548,19 +883,27 @@ def render_region(resolver, region, out_dir):
 
     layer_summary = ",".join(f"L{k}:{v}" for k, v in sorted(layer_counts.items()))
     suffix = "" if len(written) == 1 else f" (+{len(written) - 1} per-layer)"
+    # Order sources non-vanilla-first so mod-modified regions stand out.
+    non_vanilla = sorted(s for s in sources if s and s != "vanilla")
+    has_vanilla = "vanilla" in sources
+    src_tag = "+".join(non_vanilla + (["vanilla"] if has_vanilla else []))
+    tag = "vanilla" if src_tag == "vanilla" else f"MOD[{src_tag}]"
     return region, (
-        f"ok ({len(room_data)}/{len(rooms_map)} rooms [{layer_summary}], "
-        f"{drawn_conn} conns) -> {out_path}{suffix}"
+        f"{tag:<24} ok ({len(room_data)}/{len(rooms_map)} rooms "
+        f"[{layer_summary}], {drawn_conn} conns) -> {out_path}{suffix}"
     )
 
 
 def _worker(args):
-    (mod_roots, vanilla_root, slugcat, separate_layers, style,
-     region, out_dir) = args
+    (mod_roots, vanilla_root, slugcat, separate_layers, style, palette,
+     optimize, name_from_modinfo, region, out_dir) = args
     try:
-        resolver = Resolver(mod_roots, vanilla_root, slugcat)
+        resolver = Resolver(mod_roots, vanilla_root, slugcat,
+                            name_from_modinfo=name_from_modinfo)
         resolver.separate_layers = separate_layers
         resolver.style = style
+        resolver.palette = palette
+        resolver.optimize = optimize
         return render_region(resolver, region, out_dir)
     except Exception as e:
         return region, f"error: {type(e).__name__}: {e}"
@@ -574,26 +917,51 @@ def main():
     p.add_argument("--mod", action="append", default=None,
                    help="Workshop ID or absolute path. Repeat for multiple "
                         "mods (left = higher priority). Default: 3033569804")
+    p.add_argument("--game", default=GAME_DEFAULT,
+                   help="Rain World install path (the folder containing "
+                        "RainWorld_Data/). The vanilla world and workshop "
+                        "folder are derived from this. Default: standard "
+                        "Steam location on C:.")
     p.add_argument("--no-local-mods", action="store_true",
                    help="Skip auto-including StreamingAssets/mods/* as layers")
     p.add_argument("--separate-layers", action="store_true",
                    help="Also emit one SVG per canLayer: <region>_L<N>.svg")
-    p.add_argument("--filled", action="store_true",
-                   help="Use the filled (solid black blocks) style. "
-                        "Default is outline: boundary lines + slope diagonals.")
+    p.add_argument("--outline", action="store_true",
+                   help="Use the outline (wireframe) style instead of the "
+                        "default filled style. Outline is cream-bg with thin "
+                        "black edges + slope diagonals.")
+    p.add_argument("--invert", action="store_true",
+                   help="Invert every colour in the palette.")
+    p.add_argument("--no-optimize", action="store_true",
+                   help="Emit one rect per solid-tile row (legacy output) "
+                        "instead of merging solids + slopes into a single "
+                        "<path> per connected component. Filled style only.")
+    p.add_argument("--name-from-modinfo", action="store_true",
+                   help="In source tags, label each mod by the `name` field "
+                        "from its modinfo.json (e.g. 'The Champion') instead "
+                        "of the workshop ID / folder name. Falls back to "
+                        "folder name when modinfo.json is missing or broken.")
     p.add_argument("--region", default="all",
                    help="Region code (e.g. su, dm) or 'all'")
     p.add_argument("--slugcat", default="thechampion",
                    help="Slugcat id for campaign-specific file variants "
                         "(e.g. map_oe-<id>.txt). Empty string disables.")
-    p.add_argument("--vanilla", default=VANILLA_DEFAULT)
+    p.add_argument("--vanilla", default=None,
+                   help="Override the StreamingAssets path (default: derived "
+                        "from --game).")
+    p.add_argument("--workshop", default=None,
+                   help="Override the workshop content path used to resolve "
+                        "bare workshop IDs (default: derived from --game).")
     p.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "out"))
     args = p.parse_args()
 
+    vanilla_root = args.vanilla or vanilla_for(args.game)
+    workshop_root = args.workshop or workshop_for(args.game)
+
     mod_args = args.mod or ["3033569804"]
-    mod_roots = [resolve_mod(m) for m in mod_args]
+    mod_roots = [resolve_mod(m, workshop_root) for m in mod_args]
     if not args.no_local_mods:
-        local_mods_dir = os.path.join(args.vanilla, "mods")
+        local_mods_dir = os.path.join(vanilla_root, "mods")
         if os.path.isdir(local_mods_dir):
             for entry in sorted(os.listdir(local_mods_dir)):
                 p = os.path.join(local_mods_dir, entry)
@@ -602,7 +970,8 @@ def main():
     slugcat = args.slugcat or None
     os.makedirs(args.out, exist_ok=True)
 
-    resolver = Resolver(mod_roots, args.vanilla, slugcat)
+    resolver = Resolver(mod_roots, vanilla_root, slugcat,
+                        name_from_modinfo=args.name_from_modinfo)
     available = resolver.regions()
     if args.region.lower() == "all":
         regions = available
@@ -611,15 +980,21 @@ def main():
         if regions[0] not in available:
             print(f"warning: '{regions[0]}' not in any layer", file=sys.stderr)
 
+    print(f"game:    {args.game}")
     print(f"mods:    {mod_roots}")
-    print(f"vanilla: {args.vanilla}")
+    print(f"vanilla: {vanilla_root}")
     print(f"slugcat: {slugcat}")
     print(f"regions: {regions}")
     print(f"out:     {args.out}\n")
 
-    style = "filled" if args.filled else "outline"
-    work = [(mod_roots, args.vanilla, slugcat, args.separate_layers, style,
-             r, args.out) for r in regions]
+    style = "outline" if args.outline else "filled"
+    palette = PALETTES[style]
+    if args.invert:
+        palette = invert_palette(palette)
+    optimize = not args.no_optimize
+    work = [(mod_roots, vanilla_root, slugcat, args.separate_layers, style,
+             palette, optimize, args.name_from_modinfo, r, args.out)
+            for r in regions]
     with ProcessPoolExecutor() as ex:
         for region, msg in ex.map(_worker, work):
             print(f"[{region:>4}] {msg}")
