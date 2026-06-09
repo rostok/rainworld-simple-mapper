@@ -5,20 +5,26 @@ Renders rudimentary Rain World region geometry maps as SVG. Solids / platforms /
 ## Usage
 
 ```
-python mapper.py                              # Champion mod, all regions
+python mapper.py                              # vanilla + local mods, all regions
+python mapper.py --scan                       # list every mod that contributes world data, then exit
 python mapper.py --region su                  # one region
-python mapper.py --mod 1234567890             # different workshop id
+python mapper.py --mod 1234567890             # workshop id
+python mapper.py --mod champion               # partial id or modinfo `name` match (case-insensitive)
 python mapper.py --mod C:\path\to\mod\folder  # absolute path
-python mapper.py --mod 3033569804 --mod 9876  # multiple, left = higher priority
+python mapper.py --mod champion --mod outsider # multiple, left = higher priority
 python mapper.py --game D:\Games\RainWorld    # non-Steam or non-default install path
-python mapper.py --slugcat artificer          # different campaign-specific files
+python mapper.py --slugcat artificer          # campaign-specific file variants (default: none)
 python mapper.py --no-local-mods              # ignore StreamingAssets/mods/*
 python mapper.py --separate-layers            # also emit <region>_L<N>.svg per layer
 python mapper.py --outline                    # cream-bg wireframe style instead of the default filled style
 python mapper.py --invert                     # invert every colour in the palette
 python mapper.py --no-optimize                # one rect per solid-tile row (legacy output) instead of merged paths
-python mapper.py --name-from-modinfo          # show "The Champion" instead of "3033569804" in source tags
 ```
+
+`--mod` accepts a workshop id, an absolute path, or a substring of the id or
+the mod's `name` (from `modinfo.json`). A substring that matches more than one
+mod is rejected — make it more specific, or pass each mod as its own `--mod`
+argument. Run `--scan` first to see what's available.
 
 `--game` points at the Rain World install root (the folder that contains `RainWorld_Data/`). The vanilla world path and the workshop content path (`<steamapps>/workshop/content/312520`) are both derived from it. Use `--vanilla` or `--workshop` to override either independently.
 
@@ -47,7 +53,7 @@ Each region line is prefixed with a source tag derived from which layers actuall
 - `MOD[<a>]` — that mod fully replaced the region; nothing fell through to vanilla.
 - `MOD[<a>+<b>+vanilla]` — multiple sources contributed. Non-vanilla layers are listed first so they stand out at a glance. `<a>/modify` indicates the per-mod `modify/world` overlay layer.
 
-Source labels default to the workshop ID (or local mod folder name). Pass `--name-from-modinfo` to read the `name` field from each mod's `modinfo.json` instead — e.g. `3033569804` becomes `The Champion`. Falls back to the folder name when `modinfo.json` is missing or malformed.
+Source labels use the `name` field from each mod's `modinfo.json` (e.g. `The Champion`, `More Slugcats Expansion`). Falls back to the workshop ID / folder name when `modinfo.json` is missing or malformed.
 
 ## Output optimization
 

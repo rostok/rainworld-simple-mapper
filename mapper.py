@@ -94,13 +94,84 @@ def _load_mod_name(mod_root, fallback):
     return fallback
 
 
-def resolve_mod(arg, workshop_root):
+def scan_world_mods(workshop_root, local_mods_dir):
+    """List every workshop / local mod that contributes world data.
+
+    A mod qualifies if its root contains a `world/` or `modify/world/`
+    subdirectory — the two layers the Resolver consults for world files.
+    Returns a list of dicts with keys: source ('workshop' | 'local'), id,
+    folder (== id), name (from modinfo.json, falling back to folder), path.
+    """
+    results = []
+    for root, source in ((workshop_root, "workshop"), (local_mods_dir, "local")):
+        if not os.path.isdir(root):
+            continue
+        for entry in sorted(os.listdir(root)):
+            p = os.path.join(root, entry)
+            if not os.path.isdir(p):
+                continue
+            if not (os.path.isdir(os.path.join(p, "world")) or
+                    os.path.isdir(os.path.join(p, "modify", "world"))):
+                continue
+            results.append({
+                "source": source,
+                "id": entry,
+                "folder": entry,
+                "name": _load_mod_name(p, entry),
+                "path": p,
+            })
+    return results
+
+
+def detect_mod_slugcats(mod_root):
+    """Return the set of slugcat ids this mod ships files for.
+
+    Looks inside `world/<region>/` and `modify/world/<region>/` for files
+    matching `map_<region>-<slugcat>.txt` — the same suffix pattern the
+    Resolver consults via `_variants`. A mod with only plain `map_<region>.txt`
+    files returns an empty set."""
+    slugcats = set()
+    for sub in ("world", os.path.join("modify", "world")):
+        base = os.path.join(mod_root, sub)
+        if not os.path.isdir(base):
+            continue
+        for region in os.listdir(base):
+            rd = os.path.join(base, region)
+            if not os.path.isdir(rd):
+                continue
+            prefix = f"map_{region}-"
+            for f in os.listdir(rd):
+                if f.startswith(prefix) and f.endswith(".txt"):
+                    slug = f[len(prefix):-4]
+                    if slug:
+                        slugcats.add(slug)
+    return slugcats
+
+
+def resolve_mod(arg, mods_index):
+    """Resolve a --mod argument to a mod root path.
+
+    Accepts an absolute path, an exact id/folder match, or a case-insensitive
+    substring of either the id or the modinfo `name`. Multiple matches raise
+    SystemExit — pass each one as its own --mod arg instead.
+    """
     if os.path.isabs(arg) and os.path.isdir(arg):
         return arg
-    p = os.path.join(workshop_root, arg)
-    if os.path.isdir(p):
-        return p
-    raise SystemExit(f"mod not found: {arg} (searched {workshop_root})")
+    exact = [m for m in mods_index if m["id"] == arg]
+    if len(exact) == 1:
+        return exact[0]["path"]
+    a = arg.lower()
+    partial = [m for m in mods_index
+               if a in m["id"].lower() or a in m["name"].lower()]
+    if len(partial) == 1:
+        return partial[0]["path"]
+    if len(partial) > 1:
+        listing = ", ".join(f"{m['id']} ({m['name']!r})" for m in partial)
+        raise SystemExit(
+            f"--mod '{arg}' is ambiguous; matched {len(partial)}: {listing}. "
+            f"Use a more specific substring, or pass each as its own --mod arg."
+        )
+    raise SystemExit(f"--mod '{arg}' did not match any world-changing mod")
 
 
 class Resolver:
@@ -108,13 +179,15 @@ class Resolver:
     per-mod world, then vanilla world. Within a layer, slugcat-suffixed
     variants (e.g. `map_oe-thechampion.txt`) win over the plain name."""
 
-    def __init__(self, mod_roots, vanilla_root, slugcat=None,
-                 name_from_modinfo=False):
+    def __init__(self, mod_roots, vanilla_root, slugcat=None):
         self.layers = []
         self.labels = []   # parallel to self.layers; short tag for console output
         for m in mod_roots:
             base = os.path.basename(os.path.normpath(m))
-            name = _load_mod_name(m, base) if name_from_modinfo else base
+            # Source tags use the modinfo `name` (e.g. "The Champion") rather
+            # than the workshop id, so MOD[…] is recognizable at a glance. Falls
+            # back to the folder name when modinfo.json is missing / malformed.
+            name = _load_mod_name(m, base)
             self.layers.append(os.path.join(m, "modify", "world"))
             self.labels.append(f"{name}/modify")
             self.layers.append(os.path.join(m, "world"))
@@ -896,10 +969,9 @@ def render_region(resolver, region, out_dir):
 
 def _worker(args):
     (mod_roots, vanilla_root, slugcat, separate_layers, style, palette,
-     optimize, name_from_modinfo, region, out_dir) = args
+     optimize, region, out_dir) = args
     try:
-        resolver = Resolver(mod_roots, vanilla_root, slugcat,
-                            name_from_modinfo=name_from_modinfo)
+        resolver = Resolver(mod_roots, vanilla_root, slugcat)
         resolver.separate_layers = separate_layers
         resolver.style = style
         resolver.palette = palette
@@ -915,8 +987,15 @@ def main():
                     "with workshop mod files prioritized over vanilla."
     )
     p.add_argument("--mod", action="append", default=None,
-                   help="Workshop ID or absolute path. Repeat for multiple "
-                        "mods (left = higher priority). Default: 3033569804")
+                   help="Workshop ID, absolute path, or substring of a mod's "
+                        "id or modinfo `name`. Repeat for multiple mods "
+                        "(left = higher priority). A substring matching more "
+                        "than one mod is rejected — split it into separate "
+                        "--mod args. Use --scan to list available mods.")
+    p.add_argument("--scan", action="store_true",
+                   help="List every workshop / local mod that contributes "
+                        "world data (has world/ or modify/world/) and exit. "
+                        "Shows source, id/folder, name, and path.")
     p.add_argument("--game", default=GAME_DEFAULT,
                    help="Rain World install path (the folder containing "
                         "RainWorld_Data/). The vanilla world and workshop "
@@ -936,16 +1015,11 @@ def main():
                    help="Emit one rect per solid-tile row (legacy output) "
                         "instead of merging solids + slopes into a single "
                         "<path> per connected component. Filled style only.")
-    p.add_argument("--name-from-modinfo", action="store_true",
-                   help="In source tags, label each mod by the `name` field "
-                        "from its modinfo.json (e.g. 'The Champion') instead "
-                        "of the workshop ID / folder name. Falls back to "
-                        "folder name when modinfo.json is missing or broken.")
     p.add_argument("--region", default="all",
                    help="Region code (e.g. su, dm) or 'all'")
-    p.add_argument("--slugcat", default="thechampion",
+    p.add_argument("--slugcat", default="",
                    help="Slugcat id for campaign-specific file variants "
-                        "(e.g. map_oe-<id>.txt). Empty string disables.")
+                        "(e.g. map_oe-<id>.txt). Empty disables (default).")
     p.add_argument("--vanilla", default=None,
                    help="Override the StreamingAssets path (default: derived "
                         "from --game).")
@@ -957,21 +1031,58 @@ def main():
 
     vanilla_root = args.vanilla or vanilla_for(args.game)
     workshop_root = args.workshop or workshop_for(args.game)
+    local_mods_dir = os.path.join(vanilla_root, "mods")
 
-    mod_args = args.mod or ["3033569804"]
-    mod_roots = [resolve_mod(m, workshop_root) for m in mod_args]
-    if not args.no_local_mods:
-        local_mods_dir = os.path.join(vanilla_root, "mods")
-        if os.path.isdir(local_mods_dir):
-            for entry in sorted(os.listdir(local_mods_dir)):
-                p = os.path.join(local_mods_dir, entry)
-                if os.path.isdir(p) and p not in mod_roots:
-                    mod_roots.append(p)
-    slugcat = args.slugcat or None
+    mods_index = scan_world_mods(workshop_root, local_mods_dir)
+
+    if args.scan:
+        if not mods_index:
+            print("no world-changing mods found in:")
+            print(f"  workshop: {workshop_root}")
+            print(f"  local:    {local_mods_dir}")
+            return
+        w_src = max(len(m["source"]) for m in mods_index)
+        w_id = max(len(m["id"]) for m in mods_index)
+        print(f"world-changing mods ({len(mods_index)}):")
+        for m in mods_index:
+            print(f"  {m['source']:<{w_src}}  {m['id']:<{w_id}}  "
+                  f"name={m['name']!r}  -> {m['path']}")
+        return
+
+    mod_args = args.mod or []
+    explicit_mod_roots = [resolve_mod(m, mods_index) for m in mod_args]
+    mod_roots = list(explicit_mod_roots)
+    if not args.no_local_mods and os.path.isdir(local_mods_dir):
+        for entry in sorted(os.listdir(local_mods_dir)):
+            p = os.path.join(local_mods_dir, entry)
+            if os.path.isdir(p) and p not in mod_roots:
+                mod_roots.append(p)
+
+    # Auto-detect slugcat from the explicitly-selected mods only. Local mods
+    # like moreslugcats ship files for many slugcats — auto-detecting from
+    # them would be ambiguous, so they're skipped here. Pass --slugcat to
+    # override or to pick one when several mods disagree.
+    if args.slugcat:
+        slugcat = args.slugcat
+        slugcat_source = "explicit"
+    else:
+        detected = set()
+        for m in explicit_mod_roots:
+            detected |= detect_mod_slugcats(m)
+        if len(detected) == 1:
+            slugcat = next(iter(detected))
+            slugcat_source = "auto"
+        elif len(detected) > 1:
+            raise SystemExit(
+                f"selected mods ship files for multiple slugcats: "
+                f"{sorted(detected)}. Pass --slugcat <id> to pick one."
+            )
+        else:
+            slugcat = None
+            slugcat_source = "none"
     os.makedirs(args.out, exist_ok=True)
 
-    resolver = Resolver(mod_roots, vanilla_root, slugcat,
-                        name_from_modinfo=args.name_from_modinfo)
+    resolver = Resolver(mod_roots, vanilla_root, slugcat)
     available = resolver.regions()
     if args.region.lower() == "all":
         regions = available
@@ -983,7 +1094,9 @@ def main():
     print(f"game:    {args.game}")
     print(f"mods:    {mod_roots}")
     print(f"vanilla: {vanilla_root}")
-    print(f"slugcat: {slugcat}")
+    slugcat_tag = (f"{slugcat} (auto)" if slugcat_source == "auto"
+                   else str(slugcat))
+    print(f"slugcat: {slugcat_tag}")
     print(f"regions: {regions}")
     print(f"out:     {args.out}\n")
 
@@ -993,7 +1106,7 @@ def main():
         palette = invert_palette(palette)
     optimize = not args.no_optimize
     work = [(mod_roots, vanilla_root, slugcat, args.separate_layers, style,
-             palette, optimize, args.name_from_modinfo, r, args.out)
+             palette, optimize, r, args.out)
             for r in regions]
     with ProcessPoolExecutor() as ex:
         for region, msg in ex.map(_worker, work):
