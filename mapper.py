@@ -778,6 +778,66 @@ def _emit_seg(out, x1, y1, x2, y2, color):
     )
 
 
+def detect_overlaps(room_data):
+    """Pairwise AABB overlap test over devPos room footprints.
+
+    room_data: name -> (w, h, ll_x, ll_y, tiles, layer, cx, cy). devPos is
+    supposed to give a flat, non-overlapping layout (see parse_map_file
+    docstring); modded maps sometimes violate this. Returns a list of
+    (nameA, nameB) pairs whose rects overlap (touching edges don't count).
+    """
+    boxes = []
+    for name, (w, h, ll_x, ll_y, _t, _l, _cx, _cy) in room_data.items():
+        boxes.append((name, ll_x, ll_y, ll_x + w * TILE_UNITS, ll_y + h * TILE_UNITS))
+    overlaps = []
+    for i in range(len(boxes)):
+        na, ax0, ay0, ax1, ay1 = boxes[i]
+        for j in range(i + 1, len(boxes)):
+            nb, bx0, by0, bx1, by1 = boxes[j]
+            if ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1:
+                overlaps.append((na, nb))
+    return overlaps
+
+
+def resolve_overlaps(room_data, max_passes=200):
+    """Iteratively push overlapping room rects apart.
+
+    Simple shallowest-axis AABB separation: for each overlapping pair, find
+    the smaller-penetration axis (x or y) and shift both rooms apart by half
+    the overlap depth along it. Repeats until no overlaps remain or
+    max_passes is exhausted. Mutates room_data's ll_x/ll_y/cx/cy in place.
+    Returns True if fully resolved.
+    """
+    for _ in range(max_passes):
+        overlaps = detect_overlaps(room_data)
+        if not overlaps:
+            return True
+        for na, nb in overlaps:
+            wa, ha, ax, ay, ta, la, _cxa, _cya = room_data[na]
+            wb, hb, bx, by, tb, lb, _cxb, _cyb = room_data[nb]
+            ax1, ay1 = ax + wa * TILE_UNITS, ay + ha * TILE_UNITS
+            bx1, by1 = bx + wb * TILE_UNITS, by + hb * TILE_UNITS
+            overlap_x = min(ax1, bx1) - max(ax, bx)
+            overlap_y = min(ay1, by1) - max(ay, by)
+            if overlap_x <= 0 or overlap_y <= 0:
+                continue
+            if overlap_x < overlap_y:
+                shift = overlap_x / 2.0 + 0.05
+                if ax < bx:
+                    ax -= shift; bx += shift
+                else:
+                    ax += shift; bx -= shift
+            else:
+                shift = overlap_y / 2.0 + 0.05
+                if ay < by:
+                    ay -= shift; by += shift
+                else:
+                    ay += shift; by -= shift
+            room_data[na] = (wa, ha, ax, ay, ta, la, ax + wa * TILE_UNITS / 2.0, ay + ha * TILE_UNITS / 2.0)
+            room_data[nb] = (wb, hb, bx, by, tb, lb, bx + wb * TILE_UNITS / 2.0, by + hb * TILE_UNITS / 2.0)
+    return not detect_overlaps(room_data)
+
+
 def render_region(resolver, region, out_dir):
     map_path, map_src = resolver.region_file(region, f"map_{region}.txt")
     if not map_path:
@@ -785,6 +845,16 @@ def render_region(resolver, region, out_dir):
 
     rooms_map, conn_entries = parse_map_file(map_path)
     sources = {map_src}
+
+    # In-game display name, e.g. "Garbage Wastes" — World/<region>/DisplayName.txt,
+    # same layer+slugcat resolution as map_*.txt (Region.cs:617 GetRegionFullName).
+    display_path, _dn_src = resolver.region_file(region, "DisplayName.txt")
+    display_name = region.upper()
+    if display_path:
+        try:
+            display_name = read_lines(display_path)[0].strip() or display_name
+        except (IndexError, OSError):
+            pass
 
     # Cache geometry-derived per-room data we need below.
     room_data = {}  # name -> (w, h, ll_x, ll_y, tiles, layer)
@@ -816,6 +886,28 @@ def render_region(resolver, region, out_dir):
 
     if not room_data:
         return region, f"skip (0/{len(rooms_map)} rooms had geometry)"
+
+    overlaps = detect_overlaps(room_data)
+    if overlaps:
+        sample = ", ".join(f"{a}<->{b}" for a, b in overlaps[:5])
+        more = f" (+{len(overlaps) - 5} more)" if len(overlaps) > 5 else ""
+        print(f"warning: [{region}] {len(overlaps)} overlapping room pair(s): "
+              f"{sample}{more}", file=sys.stderr)
+        if getattr(resolver, "fix_overlaps", False):
+            resolved = resolve_overlaps(room_data)
+            print(f"[{region}] overlap fix: "
+                  f"{'resolved' if resolved else 'partially resolved'}",
+                  file=sys.stderr)
+            # Bounding box may have grown/shifted — recompute.
+            min_x = min_y = float("inf")
+            max_x = max_y = float("-inf")
+            for (w, h, ll_x, ll_y, _t, _l, _cx, _cy) in room_data.values():
+                rx1 = ll_x + w * TILE_UNITS
+                ry1 = ll_y + h * TILE_UNITS
+                if ll_x < min_x: min_x = ll_x
+                if ll_y < min_y: min_y = ll_y
+                if rx1 > max_x:  max_x = rx1
+                if ry1 > max_y:  max_y = ry1
 
     layer_counts = {}
     for (_w, _h, _x, _y, _t, layer, _cx, _cy) in room_data.values():
@@ -907,6 +999,13 @@ def render_region(resolver, region, out_dir):
         f'<rect x="{vb_x:.1f}" y="{vb_y:.1f}" width="{vb_w:.1f}" '
         f'height="{vb_h:.1f}" fill="{palette["bg"]}"/>'
     )
+    title_font_size = getattr(resolver, "title_font_size", 70)
+    title_text = (
+        f'<text x="{vb_x + 6:.1f}" y="{vb_y + title_font_size + 2:.1f}" '
+        f'font-size="{title_font_size}" '
+        f'fill="{label_color}" font-family="monospace">'
+        f'{display_name} ({region.upper()})</text>'
+    )
 
     all_layers = sorted(set(list(layer_geo) + list(layer_marks) + list(layer_labels)))
 
@@ -918,7 +1017,10 @@ def render_region(resolver, region, out_dir):
         with open(path, "w", encoding="utf-8") as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
             f.write(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{viewbox}">\n')
+            f.write(f'<title>{display_name} ({region.upper()})</title>\n')
             f.write(bg_rect + "\n")
+            if getattr(resolver, "show_title", True):
+                f.write(title_text + "\n")
             for layer in render_layers:
                 f.write(
                     f'<g id="layer-{layer}" shape-rendering="crispEdges">\n'
@@ -969,13 +1071,16 @@ def render_region(resolver, region, out_dir):
 
 def _worker(args):
     (mod_roots, vanilla_root, slugcat, separate_layers, style, palette,
-     optimize, region, out_dir) = args
+     optimize, fix_overlaps, show_title, title_font_size, region, out_dir) = args
     try:
         resolver = Resolver(mod_roots, vanilla_root, slugcat)
         resolver.separate_layers = separate_layers
         resolver.style = style
         resolver.palette = palette
         resolver.optimize = optimize
+        resolver.fix_overlaps = fix_overlaps
+        resolver.show_title = show_title
+        resolver.title_font_size = title_font_size
         return render_region(resolver, region, out_dir)
     except Exception as e:
         return region, f"error: {type(e).__name__}: {e}"
@@ -1015,6 +1120,17 @@ def main():
                    help="Emit one rect per solid-tile row (legacy output) "
                         "instead of merging solids + slopes into a single "
                         "<path> per connected component. Filled style only.")
+    p.add_argument("--fix-overlaps", action="store_true",
+                   help="If overlapping room layouts are detected (devPos "
+                        "rects intersecting), run a simple iterative "
+                        "separation pass to spread them apart. No-op when "
+                        "no overlap is detected. Off by default.")
+    p.add_argument("--no-title", action="store_true",
+                   help="Don't draw the visible region-name label in the "
+                        "top-left corner of the SVG.")
+    p.add_argument("--title-font-size", type=float, default=70,
+                   help="Font size (px) of the visible region-name label. "
+                        "Default: 70.")
     p.add_argument("--region", default="all",
                    help="Region code (e.g. su, dm) or 'all'")
     p.add_argument("--slugcat", default="",
@@ -1106,7 +1222,8 @@ def main():
         palette = invert_palette(palette)
     optimize = not args.no_optimize
     work = [(mod_roots, vanilla_root, slugcat, args.separate_layers, style,
-             palette, optimize, r, args.out)
+             palette, optimize, args.fix_overlaps, not args.no_title,
+             args.title_font_size, r, args.out)
             for r in regions]
     with ProcessPoolExecutor() as ex:
         for region, msg in ex.map(_worker, work):
