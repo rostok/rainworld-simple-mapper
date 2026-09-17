@@ -838,6 +838,243 @@ def resolve_overlaps(room_data, max_passes=200):
     return not detect_overlaps(room_data)
 
 
+def _total_conn_length(room_data, conn_entries):
+    """Sum of centre-to-centre distances over all room-room connections
+    (each connection pair counted once per Connection: entry)."""
+    import math
+    total = 0.0
+    for entry in conn_entries:
+        a, b = entry[0], entry[1]
+        if a not in room_data or b not in room_data or a == b:
+            continue
+        _wa, _ha, _ax, _ay, _ta, _la, cxa, cya = room_data[a]
+        _wb, _hb, _bx, _by, _tb, _lb, cxb, cyb = room_data[b]
+        total += math.hypot(cxb - cxa, cyb - cya)
+    return total
+
+
+def _bfs_hop_distances(names, edges):
+    """All-pairs shortest-path distance (hop count) over the undirected
+    connection graph. Returns (idx: name->int, dist: NxN list, INF for
+    unreachable pairs)."""
+    from collections import deque
+
+    idx = {n: i for i, n in enumerate(names)}
+    n = len(names)
+    adj = {nm: set() for nm in names}
+    for a, b in edges:
+        adj[a].add(b)
+        adj[b].add(a)
+    INF = float("inf")
+    dist = [[INF] * n for _ in range(n)]
+    for start in names:
+        si = idx[start]
+        dist[si][si] = 0
+        visited = {start: 0}
+        dq = deque([start])
+        while dq:
+            cur = dq.popleft()
+            d = visited[cur]
+            for nb in adj[cur]:
+                if nb not in visited:
+                    visited[nb] = d + 1
+                    dq.append(nb)
+        for node, d in visited.items():
+            dist[si][idx[node]] = d
+    return idx, dist
+
+
+def _refine_door_alignment(pos, idx, room_data, conn_entries,
+                            iterations=150, damping=0.6):
+    """Post-KK refinement that nudges room centres so connected doors — not
+    room centres — end up close together.
+
+    KK/stress-majorization only ever reasons about centre-to-centre
+    distance. For a long, narrow, or off-centre-door room (a corridor whose
+    shortcut is at one end, say) that's a poor proxy: two rooms can have
+    well-placed centres and still have their actual `Connection:` tiles far
+    apart. Each `Connection:` entry fixes a door's offset from its room's
+    centre (intrinsic to the room's geometry, unaffected by translation), so
+    "make door_a coincide with door_b" is the linear constraint
+    `pos_a - pos_b == offset_b - offset_a`. Solved by Jacobi relaxation
+    (damped, so it nudges the KK layout rather than replacing its topology).
+    Rooms with no connections are left untouched.
+    """
+    edges = []
+    for entry in conn_entries:
+        a, b, ax, ay, bx, by = entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]
+        if a not in idx or b not in idx or a == b:
+            continue
+        wa, ha = room_data[a][0], room_data[a][1]
+        wb, hb = room_data[b][0], room_data[b][1]
+        off_a = ((ax + 0.5) * TILE_UNITS - wa * TILE_UNITS / 2.0,
+                 (ay + 0.5) * TILE_UNITS - ha * TILE_UNITS / 2.0)
+        off_b = ((bx + 0.5) * TILE_UNITS - wb * TILE_UNITS / 2.0,
+                 (by + 0.5) * TILE_UNITS - hb * TILE_UNITS / 2.0)
+        pref = (off_b[0] - off_a[0], off_b[1] - off_a[1])  # want pos_a - pos_b == pref
+        edges.append((idx[a], idx[b], pref))
+    if not edges:
+        return
+
+    neighbors = {i: [] for i in range(len(pos))}
+    for i, j, pref in edges:
+        neighbors[i].append((j, pref))
+        neighbors[j].append((i, (-pref[0], -pref[1])))
+
+    for _ in range(iterations):
+        new_pos = [p[:] for p in pos]
+        for i, nbrs in neighbors.items():
+            if not nbrs:
+                continue
+            sx = sum(pos[j][0] + pref[0] for j, pref in nbrs)
+            sy = sum(pos[j][1] + pref[1] for j, pref in nbrs)
+            tx, ty = sx / len(nbrs), sy / len(nbrs)
+            new_pos[i][0] = pos[i][0] + damping * (tx - pos[i][0])
+            new_pos[i][1] = pos[i][1] + damping * (ty - pos[i][1])
+        pos[:] = new_pos
+
+
+def _door_align_pass(room_data, conn_entries, iterations=80, damping=0.5):
+    """Like `_refine_door_alignment`, but reads/writes room_data's cx/cy
+    directly instead of a separate `pos` array — for use between overlap-fix
+    nudges in `render_region`'s relax cycle, where re-running the full KK
+    stress majorization each cycle would just re-collapse rooms that
+    overlap-fix had just spread apart."""
+    names = [nm for nm in room_data
+             if any((e[0] == nm or e[1] == nm) for e in conn_entries)]
+    if not names:
+        return
+    idx = {nm: i for i, nm in enumerate(names)}
+    pos = [[room_data[nm][6], room_data[nm][7]] for nm in names]
+    _refine_door_alignment(pos, idx, room_data, conn_entries,
+                            iterations=iterations, damping=damping)
+    for i, nm in enumerate(names):
+        w, h, _ax, _ay, tiles, layer, _cx, _cy = room_data[nm]
+        ncx, ncy = pos[i]
+        room_data[nm] = (
+            w, h, ncx - w * TILE_UNITS / 2.0, ncy - h * TILE_UNITS / 2.0,
+            tiles, layer, ncx, ncy,
+        )
+
+
+def optimize_layout(room_data, conn_entries, iterations=300, seed=0,
+                     eps=1e-3, scale_mult=0.85, door_align_iters=150):
+    """Kamada-Kawai layout via stress majorization (SMACOF).
+
+    Graph-theoretic distance (BFS hop count over the connection graph)
+    defines an ideal geometric distance for every room pair: directly
+    connected rooms should end up close, rooms several hops apart should end
+    up proportionally farther, disconnected components are pushed apart by a
+    mild fixed distance so they don't collapse onto each other. Each
+    iteration recomputes every room's position as the weighted average of
+    "where it should sit relative to every other room to hit its ideal
+    distance" (the Guttman transform) — this provably never increases total
+    stress and converges to a local stress minimum, without hand-tuned force
+    constants. O(n^2) per iteration; fine for the room counts a region has
+    (low hundreds).
+
+    `resolve_overlaps` still runs afterwards — this only targets edge
+    length, it does not avoid overlap by itself.
+
+    Mutates room_data's ll_x/ll_y/cx/cy in place (w/h unchanged).
+    """
+    import math
+    import random
+
+    names = list(room_data.keys())
+    n = len(names)
+    if n < 2:
+        return
+
+    edges = set()
+    for entry in conn_entries:
+        a, b = entry[0], entry[1]
+        if a not in room_data or b not in room_data or a == b:
+            continue
+        edges.add((a, b) if a < b else (b, a))
+
+    idx, hop = _bfs_hop_distances(names, edges)
+    INF = float("inf")
+    finite = [hop[i][j] for i in range(n) for j in range(n)
+              if i != j and hop[i][j] != INF]
+    max_finite = max(finite) if finite else 1
+    far_dist = max_finite * 1.5 + 2
+    for i in range(n):
+        for j in range(n):
+            if i != j and hop[i][j] == INF:
+                hop[i][j] = far_dist
+
+    # Ideal distance per pair: for directly-connected rooms (hop==1), use
+    # THIS pair's own half-diagonals, not a global average — a map with a
+    # few oversized rooms (e.g. one room 4x the rest) needs those specific
+    # pairs pushed further apart than a size-blind average would predict,
+    # or overlap-resolution ends up shoving the big room off in an
+    # arbitrary direction and its doors end up far from their partners.
+    # Multi-hop pairs (no direct radius pair to anchor on) fall back to the
+    # mean 1-hop target scaled by hop count.
+    radius = {nm: math.hypot(room_data[nm][0], room_data[nm][1]) / 2.0
+              * TILE_UNITS for nm in names}
+    edge_targets = [(radius[a] + radius[b]) * scale_mult for a, b in edges]
+    avg_edge_target = (sum(edge_targets) / len(edge_targets)
+                        if edge_targets else radius[names[0]] * scale_mult)
+
+    L = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if hop[i][j] == 1:
+                L[i][j] = (radius[names[i]] + radius[names[j]]) * scale_mult
+            else:
+                L[i][j] = avg_edge_target * hop[i][j]
+    W = [[0.0 if i == j else 1.0 / (hop[i][j] * hop[i][j])
+          for j in range(n)] for i in range(n)]
+
+    rng = random.Random(seed)
+    pos = [[room_data[names[i]][6] + rng.uniform(-0.01, 0.01),
+            room_data[names[i]][7] + rng.uniform(-0.01, 0.01)]
+           for i in range(n)]
+
+    for _ in range(iterations):
+        new_pos = [None] * n
+        moved = 0.0
+        for i in range(n):
+            xi, yi = pos[i]
+            wsum = sx = sy = 0.0
+            for j in range(n):
+                if i == j:
+                    continue
+                xj, yj = pos[j]
+                dx = xi - xj; dy = yi - yj
+                d = math.hypot(dx, dy) or 1e-9
+                lij = L[i][j]
+                w = W[i][j]
+                sx += w * (xj + lij * dx / d)
+                sy += w * (yj + lij * dy / d)
+                wsum += w
+            if wsum > 0:
+                nx, ny = sx / wsum, sy / wsum
+            else:
+                nx, ny = xi, yi
+            moved += math.hypot(nx - xi, ny - yi)
+            new_pos[i] = [nx, ny]
+        pos = new_pos
+        if moved / n < eps:
+            break
+
+    if door_align_iters:
+        _refine_door_alignment(pos, idx, room_data, conn_entries,
+                                iterations=door_align_iters)
+
+    for i, nm in enumerate(names):
+        w, h, _ax, _ay, tiles, layer, _cx, _cy = room_data[nm]
+        ncx, ncy = pos[i]
+        room_data[nm] = (
+            w, h, ncx - w * TILE_UNITS / 2.0, ncy - h * TILE_UNITS / 2.0,
+            tiles, layer, ncx, ncy,
+        )
+
+
 def render_region(resolver, region, out_dir):
     map_path, map_src = resolver.region_file(region, f"map_{region}.txt")
     if not map_path:
@@ -887,6 +1124,41 @@ def render_region(resolver, region, out_dir):
     if not room_data:
         return region, f"skip (0/{len(rooms_map)} rooms had geometry)"
 
+    if getattr(resolver, "layout_optimize", False):
+        before_len = _total_conn_length(room_data, conn_entries)
+        # A single KK pass + a single overlap-resolve pass fights itself:
+        # overlap-resolve is a dumb greedy AABB push, blind to which rooms
+        # are connected, so it happily shoves the careful door alignment KK
+        # just built back out of alignment. And re-running full KK
+        # afterwards is worse — it re-collapses rooms overlap-fix just
+        # spread apart, not knowing that spacing was load-bearing. So: one
+        # KK pass for overall topology, one full resolve_overlaps to reach a
+        # legal (non-overlapping) layout, then alternate cheap door-only
+        # realignment with *small* overlap nudges — each cycle only
+        # re-introduces a little overlap for the next nudge to clean up,
+        # converging to a compromise that stays overlap-free and pulls
+        # doors closer than the first resolve alone achieved. Swept
+        # scale_mult/cycle-count/damping against `su`, `cc`, `sh`, `rp`;
+        # damping=0.3 consistently beat 0.45, gains taper off past ~14-16
+        # cycles, scale_mult 0.8-0.9 consistently on top.
+        optimize_layout(room_data, conn_entries, scale_mult=0.85)
+        resolve_overlaps(room_data, max_passes=2000)
+        for _ in range(14):
+            _door_align_pass(room_data, conn_entries, iterations=40, damping=0.3)
+            resolve_overlaps(room_data, max_passes=500)
+        after_len = _total_conn_length(room_data, conn_entries)
+        print(f"[{region}] layout optimize: total connection length "
+              f"{before_len:.1f} -> {after_len:.1f}", file=sys.stderr)
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        for (w, h, ll_x, ll_y, _t, _l, _cx, _cy) in room_data.values():
+            rx1 = ll_x + w * TILE_UNITS
+            ry1 = ll_y + h * TILE_UNITS
+            if ll_x < min_x: min_x = ll_x
+            if ll_y < min_y: min_y = ll_y
+            if rx1 > max_x:  max_x = rx1
+            if ry1 > max_y:  max_y = ry1
+
     overlaps = detect_overlaps(room_data)
     if overlaps:
         sample = ", ".join(f"{a}<->{b}" for a, b in overlaps[:5])
@@ -894,7 +1166,8 @@ def render_region(resolver, region, out_dir):
         print(f"warning: [{region}] {len(overlaps)} overlapping room pair(s): "
               f"{sample}{more}", file=sys.stderr)
         if getattr(resolver, "fix_overlaps", False):
-            resolved = resolve_overlaps(room_data)
+            max_passes = 2000 if getattr(resolver, "layout_optimize", False) else 200
+            resolved = resolve_overlaps(room_data, max_passes=max_passes)
             print(f"[{region}] overlap fix: "
                   f"{'resolved' if resolved else 'partially resolved'}",
                   file=sys.stderr)
@@ -1071,7 +1344,8 @@ def render_region(resolver, region, out_dir):
 
 def _worker(args):
     (mod_roots, vanilla_root, slugcat, separate_layers, style, palette,
-     optimize, fix_overlaps, show_title, title_font_size, region, out_dir) = args
+     optimize, fix_overlaps, layout_optimize, show_title, title_font_size,
+     region, out_dir) = args
     try:
         resolver = Resolver(mod_roots, vanilla_root, slugcat)
         resolver.separate_layers = separate_layers
@@ -1079,6 +1353,7 @@ def _worker(args):
         resolver.palette = palette
         resolver.optimize = optimize
         resolver.fix_overlaps = fix_overlaps
+        resolver.layout_optimize = layout_optimize
         resolver.show_title = show_title
         resolver.title_font_size = title_font_size
         return render_region(resolver, region, out_dir)
@@ -1125,6 +1400,14 @@ def main():
                         "rects intersecting), run a simple iterative "
                         "separation pass to spread them apart. No-op when "
                         "no overlap is detected. Off by default.")
+    p.add_argument("--optimize", action="store_true",
+                   help="Force-directed spring layout pass that repositions "
+                        "rooms to minimize total connection-line length "
+                        "before overlap resolution. For maps whose devPos "
+                        "layout is messy (long crossing connections even "
+                        "when non-overlapping). Requires --fix-overlaps, "
+                        "since the spring pass does not itself guarantee a "
+                        "non-overlapping result.")
     p.add_argument("--no-title", action="store_true",
                    help="Don't draw the visible region-name label in the "
                         "top-left corner of the SVG.")
@@ -1220,10 +1503,14 @@ def main():
     palette = PALETTES[style]
     if args.invert:
         palette = invert_palette(palette)
+    if args.optimize and not args.fix_overlaps:
+        raise SystemExit("--optimize requires --fix-overlaps "
+                          "(the spring pass can itself introduce overlaps)")
+
     optimize = not args.no_optimize
     work = [(mod_roots, vanilla_root, slugcat, args.separate_layers, style,
-             palette, optimize, args.fix_overlaps, not args.no_title,
-             args.title_font_size, r, args.out)
+             palette, optimize, args.fix_overlaps, args.optimize,
+             not args.no_title, args.title_font_size, r, args.out)
             for r in regions]
     with ProcessPoolExecutor() as ex:
         for region, msg in ex.map(_worker, work):
