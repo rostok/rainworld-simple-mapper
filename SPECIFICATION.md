@@ -8,7 +8,9 @@ specification — what each part is for, its inputs/outputs, and its contracts.
 
 Render rudimentary geometry maps (solids / platforms / slopes / shortcuts) of
 Rain World regions as SVG, resolving files through the game's mod-override
-chain (workshop mods > local `StreamingAssets/mods` > vanilla) without ever
+chain (game-baked `mergedmods` > mods in the game's load order, with the
+selected mod's requirements and only enabled local mods > vanilla; slugcat
+file variants follow the SlugBase `world_state` inheritance chain) without ever
 writing to, or requiring write access to, the game installation. No game
 runtime is involved — this is a pure offline parser + renderer over the
 game's plain-text world data files.
@@ -21,17 +23,29 @@ files (this is a read-only tool).
 
 | Source | Path pattern | Priority |
 |---|---|---|
-| Per-mod overlay | `<mod>/modify/world/<region>/...` | Highest (per `--mod` order) |
-| Per-mod full replacement | `<mod>/world/<region>/...`, `<region>-rooms/...` | Next |
-| Local enabled mods | `StreamingAssets/mods/<localmod>/world/...` | Next (unless `--no-local-mods`) |
+| Game-baked merges | `StreamingAssets/mergedmods/world/...` | Highest (unless `--no-merged`; needs EnabledMods) |
+| `--mod` mods, their `requirements` (recursive), enabled local mods | `<mod>/world/<region>/...`, `<region>-rooms/...` | By game `ModLoadOrder` (higher wins); else `--mod` > requirements (topological, workshop > local) > local |
 | Vanilla | `StreamingAssets/world/<region>/...` | Lowest (always present as fallback) |
+
+`<mod>/modify/world` is never a file layer — it holds merge patches whose
+result the game writes to `mergedmods`.
+
+Within that stack lookup is **variant-major**: `-<chain[0]>`, `-<chain[1]>`,
+…, plain name — each searched across all layers before the next. `chain` is
+the slugcat plus its SlugBase `features.world_state` list (`--no-inherit`:
+the slugcat only).
+
+Other inputs: the game's `options` file (`EnabledMods`, `ModLoadOrder`;
+`--options`), `slugbase/*.json` of the `--mod` mods (campaign slugcats and
+their `world_state`), and every installed mod's `modinfo.json` `id` /
+`requirements`.
 
 File types consumed per region:
 
 - `map_<region>.txt` (or `map_<region>-<slugcat>.txt`) — room placement
   (`devPos`/`canPos`) and `Connection:` lines (shortcut endpoints).
-- `world_<region>.txt` — `ROOMS` section; merged across **all** layers per
-  mod `[MERGE]` semantics (not just the winning layer).
+- `world_<region>.txt` — only its presence (region discovery); contents
+  are not parsed.
 - `<region>-rooms/<roomname>.txt` (or `gates/`, `gate shelters/`) — per-room
   tile geometry.
 - `DisplayName.txt` — in-game region name, same layer/slugcat resolution as
@@ -44,8 +58,10 @@ not fatal.
 
 ## 3. Outputs
 
-- `out/<region>.svg` — one file per region (default: `out/` next to the
-  script; overridable with `--out`).
+- `out/<region>.svg` — one baked file per region (default: `out/` next to
+  the script; overridable with `--out`). With more than one campaign slugcat
+  (offered by the `--mod` mods or given via `--slugcat`):
+  `out/<slugcat>/<region>.svg`.
 - `out/<region>_L<N>.svg` — one per `canLayer`, only with `--separate-layers`.
 - Console: one line per region, prefixed with a source tag (`vanilla` /
   `MOD[<a>+<b>+vanilla]`) and a `(w×h [L0:n,...], N conns) -> path` summary.
@@ -197,6 +213,13 @@ guaranteed-crossing-free layout; all reduce, not eliminate, the problem.
 
 ## 7. Known limitations
 
+- `world_*.txt` room conditions (`EXCLUSIVEROOM`, `HIDEROOM`, conditional
+  links) are not evaluated; the resolved `map_*.txt` decides what's drawn.
+- `mergedmods` reflects the mods enabled when the game last applied mods;
+  a `--mod` that isn't enabled has its `modify/` patches missing (warned).
+- `mapper_vpsc.py` still uses the old resolver
+  (`modify/` as a file layer, no requirements / load order / inheritance).
+
 - Axis-at-a-time overlap projection (`mapper_vpsc.py`) is not a complete
   overlap-removal guarantee; relies on a greedy-pairwise fallback for the
   residue.
@@ -218,6 +241,7 @@ guaranteed-crossing-free layout; all reduce, not eliminate, the problem.
 | `mapper.py` | Main script — parsing, resolver, rendering, KK layout optimization (recommended). |
 | `mapper_vpsc.py` | Full copy of `mapper.py` with constrained-stress-majorization + parameter-search layout optimization. |
 | `mapper_springs.py` | Full copy of `mapper.py` with spring-embedder layout optimization (reference/comparison). |
+| `tests/test_resolution.py` | unittest: requirements, load order / EnabledMods, slugcat chains, Resolver lookup. `python -m unittest discover -s tests` |
 | `README.md` | User-facing usage guide. |
 | `CONVO.md` | Narrative design history (why decisions were made, in dialogue form). |
 | `SPECIFICATION.md` | This file — formal contract/reference. |

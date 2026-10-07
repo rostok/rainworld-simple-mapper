@@ -13,8 +13,13 @@ python mapper.py --mod champion               # partial id or modinfo `name` mat
 python mapper.py --mod C:\path\to\mod\folder  # absolute path
 python mapper.py --mod champion --mod outsider # multiple, left = higher priority
 python mapper.py --game D:\Games\RainWorld    # non-Steam or non-default install path
-python mapper.py --slugcat artificer          # campaign-specific file variants (default: none)
+python mapper.py --slugcat artificer          # campaign-specific file variants (repeatable; default: the --mod's campaigns)
 python mapper.py --no-local-mods              # ignore StreamingAssets/mods/*
+python mapper.py --no-deps                    # don't pull in the --mod's modinfo `requirements`
+python mapper.py --no-load-order              # ignore the game's ModLoadOrder, use the default stacking
+python mapper.py --no-merged                  # don't use StreamingAssets/mergedmods (game-baked modify/ patches)
+python mapper.py --no-inherit                 # only the slugcat's own -<id> variants, no SlugBase world_state chain
+python mapper.py --options C:\path\options    # game options file (EnabledMods / ModLoadOrder) if not in the default place
 python mapper.py --separate-layers            # also emit <region>_L<N>.svg per layer
 python mapper.py --outline                    # cream-bg wireframe style instead of the default filled style
 python mapper.py --invert                     # invert every colour in the palette
@@ -29,30 +34,73 @@ argument. Run `--scan` first to see what's available.
 
 `--game` points at the Rain World install root (the folder that contains `RainWorld_Data/`). The vanilla world path and the workshop content path (`<steamapps>/workshop/content/312520`) are both derived from it. Use `--vanilla` or `--workshop` to override either independently.
 
-Output: `out/<region>.svg` — open in a browser or convert with ImageMagick:
+Output: `out/<region>.svg` — one baked map per region. Only when the
+selected mods offer more than one campaign slugcat (or several `--slugcat`
+are given) does each get its own folder: `out/<slugcat>/<region>.svg`. Open in
+a browser or convert with ImageMagick:
 
 ```
 magick out/su.svg -density 200 out/su.png
 ```
 
-## File resolution order
+## Baking: what goes into a map
 
-For each lookup, the first existing file wins. Within a layer, slugcat-suffixed variants (`map_oe-thechampion.txt`) beat the plain name.
+The goal is the map the game itself would use for the mod's campaign. With
+`--mod X` the mapper stacks, by default:
 
-1. `<mod>/modify/world/<region>/...` — `[MERGE]` overlay layer (per-mod, in `--mod` order)
-2. `<mod>/world/<region>/...` and `<region>-rooms/...` — full replacement
-3. `StreamingAssets/mods/<localmod>/world/...` — same two-step for each enabled local mod
-4. `StreamingAssets/world/<region>/...` — vanilla
+1. **Requirements** — `X`'s modinfo `requirements`, recursively. Missing ones
+   are a warning. Code-only ones (SlugBase, Fisobs, …) appear in the printed
+   dependency tree but add no layer. `--no-deps` turns this off.
+2. **Local mods** — `StreamingAssets/mods/*`, but only those enabled in the
+   game (`EnabledMods` in the options file); disabled ones (e.g. The Watcher)
+   are listed as skipped.
+3. **Load order** — layers are sorted by the game's `ModLoadOrder` from the
+   options file (`%USERPROFILE%\AppData\LocalLow\Videocult\Rain World\options`):
+   higher load order wins, as in `AssetManager.ResolveFilePath`. Without it
+   (or with `--no-load-order`): `--mod` mods, requirements (dependents above
+   their dependencies, workshop above local), other local mods.
+4. **mergedmods** — `StreamingAssets/mergedmods/world`, the game's own bake of
+   every enabled mod's `modify/` patches, is the top layer (`--no-merged`
+   turns it off). `modify/world` folders themselves are never read as files:
+   they are patches (`[MERGE]`, `[FIND]`, `[FILEDESTINATION]`, …). mergedmods
+   only reflects mods enabled when the game last applied mods — a warning
+   lists layer mods that aren't enabled.
+5. **Vanilla** — `StreamingAssets/world`.
 
-`world_<region>.txt` is **merged** across all layers (mod `[MERGE]` semantics): every layer's `ROOMS` section contributes connection pairs.
+**Slugcat & inheritance.** Campaign slugcats of the `--mod` mods come from
+SlugBase definitions (`slugbase/*.json`) and from `map_<region>-<id>.txt`
+suffixes. A SlugBase slugcat's `world_state` list is its inheritance chain —
+e.g. The Evergreen: `TrynsEvergreen -> Saint`. A suffix that belongs to a chain
+(Evergreen's `map_su-saint.txt`) is not a separate campaign. `--slugcat`
+overrides the choice; `--no-inherit` drops the chain.
+
+**Lookup.** Variant-major, like the game's per-file resolution
+(`HUD/Map.cs:3567`): all layers are searched for `-<chain[0]>`, then
+`-<chain[1]>`, …, then the plain name; within one variant the highest layer
+wins. So Evergreen's SL map is MSC's `map_sl-saint.txt` (with the SL_SCRUSHED
+shelter) even though no Evergreen file exists for SL.
+
+`world_<region>.txt` is only used to discover regions; its room conditions
+(`EXCLUSIVEROOM`, `HIDEROOM`, …) are not evaluated — the map file decides
+which rooms are drawn.
 
 ## Console output
+
+Before rendering the mapper prints the dependency tree, skipped (disabled)
+local mods, the final layer stack with each layer's role (`merged` /
+`selected` / `dependency` / `local` / `vanilla`) and where the order came from,
+and each slugcat with its lookup chain. With several campaign slugcats an
+`info:` line says each goes to its own folder.
 
 Each region line is prefixed with a source tag derived from which layers actually contributed files for that region:
 
 - `vanilla` — every file came from `StreamingAssets/world`.
 - `MOD[<a>]` — that mod fully replaced the region; nothing fell through to vanilla.
-- `MOD[<a>+<b>+vanilla]` — multiple sources contributed. Non-vanilla layers are listed first so they stand out at a glance. `<a>/modify` indicates the per-mod `modify/world` overlay layer.
+- `MOD[<a>+<b>+vanilla]` — multiple sources contributed. Non-vanilla layers are listed first so they stand out at a glance. `mergedmods` is the game-baked layer.
+
+When a slugcat is active the line also names the map file that was baked in
+and why: `map=map_sl-Saint.txt[More Slugcats Expansion] (inherited TrynsEvergreen->Saint)`,
+`(own)` for the slugcat's own variant, `(plain)` for the unsuffixed file.
 
 Source labels use the `name` field from each mod's `modinfo.json` (e.g. `The Champion`, `More Slugcats Expansion`). Falls back to the workshop ID / folder name when `modinfo.json` is missing or malformed.
 

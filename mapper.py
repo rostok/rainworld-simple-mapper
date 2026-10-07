@@ -11,6 +11,7 @@ Format references (from C:/projects/rainworld/quicksave-mod/game-source):
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -73,24 +74,31 @@ def invert_palette(p):
             for k, v in p.items()}
 
 
+def _read_json_lenient(path):
+    """Parse a JSON file, tolerating a BOM and trailing commas — several
+    shipped modinfo.json / SlugBase files include them, which the stdlib json
+    parser rejects. Returns None on any failure."""
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            txt = f.read()
+        txt = re.sub(r",(\s*[}\]])", r"\1", txt)
+        return json.loads(txt)
+    except Exception:
+        return None
+
+
+def _load_modinfo(mod_root):
+    data = _read_json_lenient(os.path.join(mod_root, "modinfo.json"))
+    return data if isinstance(data, dict) else {}
+
+
 def _load_mod_name(mod_root, fallback):
     """Read the `name` field from `<mod_root>/modinfo.json` and return it.
     Falls back to `fallback` on any failure (missing file, parse error,
-    missing/empty field). Tolerates trailing commas — several shipped
-    modinfo.json files include them, which the stdlib json parser rejects."""
-    p = os.path.join(mod_root, "modinfo.json")
-    if not os.path.isfile(p):
-        return fallback
-    try:
-        with open(p, "r", encoding="utf-8-sig", errors="replace") as f:
-            txt = f.read()
-        txt = re.sub(r",(\s*[}\]])", r"\1", txt)
-        data = json.loads(txt)
-        name = data.get("name")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    except Exception:
-        pass
+    missing/empty field)."""
+    name = _load_modinfo(mod_root).get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
     return fallback
 
 
@@ -174,50 +182,246 @@ def resolve_mod(arg, mods_index):
     raise SystemExit(f"--mod '{arg}' did not match any world-changing mod")
 
 
-class Resolver:
-    """File lookup. Layer order (highest priority first): per-mod modify/world,
-    per-mod world, then vanilla world. Within a layer, slugcat-suffixed
-    variants (e.g. `map_oe-thechampion.txt`) win over the plain name."""
+def index_all_mods(workshop_root, local_mods_dir):
+    """Map every installed mod's modinfo `id` (lower-cased) to its root path.
+    Unlike scan_world_mods this includes code-only mods, since `requirements`
+    can name any mod. Workshop wins over local on an id clash."""
+    index = {}
+    for root in (local_mods_dir, workshop_root):
+        if not os.path.isdir(root):
+            continue
+        for entry in sorted(os.listdir(root)):
+            p = os.path.join(root, entry)
+            if not os.path.isdir(p):
+                continue
+            mod_id = _load_modinfo(p).get("id")
+            if isinstance(mod_id, str) and mod_id.strip():
+                index[mod_id.strip().lower()] = p
+    return index
 
-    def __init__(self, mod_roots, vanilla_root, slugcat=None):
+
+def resolve_requirements(mod_roots, id_index):
+    """Follow modinfo `requirements` recursively.
+
+    The game loads a mod after the mods it requires, so a dependent's files
+    override its dependencies'. Dependencies are returned highest priority
+    first in a topological order: a DFS post-order over `requirements` (in
+    listed order) is a valid load order, reversed it puts every mod above the
+    mods it needs. Mods already listed (explicit, diamond duplicates, cycles)
+    are skipped.
+
+    Returns (dep_paths, missing_ids, tree_lines) — tree_lines is a printable
+    indented dependency tree for the console."""
+    norm = lambda p: os.path.normcase(os.path.normpath(p))
+    explicit = {norm(m) for m in mod_roots}
+    visited = set(explicit)
+    load_order, missing, tree = [], [], []
+
+    def visit(parent, depth):
+        for req in _load_modinfo(parent).get("requirements") or []:
+            if not isinstance(req, str) or not req.strip():
+                continue
+            rid = req.strip()
+            path = id_index.get(rid.lower())
+            indent = "  " * (depth + 2)
+            if path is None:
+                if rid not in missing:
+                    missing.append(rid)
+                tree.append(f"{indent}{rid}: MISSING")
+                continue
+            if norm(path) in visited:
+                continue
+            visited.add(norm(path))
+            tree.append(f"{indent}{_load_mod_name(path, rid)} ({rid}) {path}")
+            visit(path, depth + 1)
+            load_order.append(path)
+
+    for m in mod_roots:
+        tree.append(f"  {_load_mod_name(m, os.path.basename(m))}")
+        visit(m, 0)
+    return load_order[::-1], missing, tree
+
+
+def default_options_path():
+    """Rain World's options file (Options.cs OPTIONS_FILE_DEFINITION "options"),
+    stored by Unity's persistentDataPath: LocalLow/Videocult/Rain World."""
+    return os.path.join(os.path.expanduser("~"), "AppData", "LocalLow",
+                        "Videocult", "Rain World", "options")
+
+
+def _read_options_field(path, key):
+    """Raw `<key><optB>...<optA>` value from the game's options file (written
+    by Options.cs, XML-escaped on disk), or None when missing/unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            txt = html.unescape(f.read())
+    except OSError:
+        return None
+    m = re.search(re.escape(key) + r"<optB>(.*?)<optA>", txt, re.S)
+    return m.group(1) if m else None
+
+
+def read_mod_load_order(path):
+    """{mod_id_lower: loadOrder} from `ModLoadOrder<optB>id<optD>N<optC>...`,
+    or {} when the file / field is missing."""
+    raw = _read_options_field(path, "ModLoadOrder")
+    order = {}
+    for item in (raw or "").split("<optC>"):
+        mod_id, sep, num = item.partition("<optD>")
+        if sep:
+            try:
+                order[mod_id.strip().lower()] = int(num)
+            except ValueError:
+                pass
+    return order
+
+
+def read_enabled_mods(path):
+    """Lower-cased ids from `EnabledMods<optB>a<optC>b...`, or None when the
+    file / field is missing (= unknown, not "nothing enabled")."""
+    raw = _read_options_field(path, "EnabledMods")
+    if raw is None:
+        return None
+    return {x.strip().lower() for x in raw.split("<optC>") if x.strip()}
+
+
+def _mod_id(mod_root):
+    mod_id = _load_modinfo(mod_root).get("id")
+    return mod_id.strip().lower() if isinstance(mod_id, str) else None
+
+
+def sort_by_load_order(mod_roots, load_order):
+    """Order mod layers like the game: AssetManager.ResolveFilePath walks
+    ActiveMods from the highest loadOrder down, so higher loadOrder = higher
+    priority. Mods without an entry keep their relative order below the
+    ranked ones. Returns (sorted_roots, unranked_roots)."""
+    ranked, unranked = [], []
+    for m in mod_roots:
+        key = _mod_id(m)
+        if key in load_order:
+            ranked.append((load_order[key], m))
+        else:
+            unranked.append(m)
+    ranked.sort(key=lambda t: -t[0])
+    return [m for _n, m in ranked] + unranked, unranked
+
+
+def detect_slugbase_slugcats(mod_root):
+    """Return {slugcat_id: chain} from `<mod>/slugbase/*.json` (top level).
+
+    chain is the SlugBase `features.world_state` list (e.g. Evergreen:
+    ["TrynsEvergreen", "Saint"]) — the slugcat's world inherits from those
+    timelines, so their `-<id>` file variants apply when the slugcat has none
+    of its own. Files without `features` (scenes, slideshows) are skipped."""
+    out = {}
+    d = os.path.join(mod_root, "slugbase")
+    if not os.path.isdir(d):
+        return out
+    for f in sorted(os.listdir(d)):
+        if not f.lower().endswith(".json"):
+            continue
+        data = _read_json_lenient(os.path.join(d, f))
+        if not isinstance(data, dict) or not isinstance(data.get("features"), dict):
+            continue
+        sid = data.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            continue
+        sid = sid.strip()
+        ws = data["features"].get("world_state")
+        if isinstance(ws, str):
+            ws = [ws]
+        chain = [s.strip() for s in (ws or []) if isinstance(s, str) and s.strip()]
+        chain = [sid] + [s for s in chain if s.lower() != sid.lower()]
+        out[sid] = chain
+    return out
+
+
+def detect_campaign_slugcats(mod_roots):
+    """Campaign slugcats offered by `mod_roots`: SlugBase definitions (with
+    their world_state chain) plus bare `map_<region>-<slug>.txt` suffixes.
+    A suffix that is already part of some SlugBase chain (e.g. Evergreen
+    shipping `map_su-saint.txt` for its inherited Saint state) is not a
+    separate campaign. Returns {id: {"chain": [...], "source": str}}."""
+    camps = {}
+    for m in mod_roots:
+        for sid, chain in detect_slugbase_slugcats(m).items():
+            if sid.lower() not in {k.lower() for k in camps}:
+                camps[sid] = {"chain": chain, "source": "slugbase"}
+    in_chain = {s.lower() for c in camps.values() for s in c["chain"]}
+    for m in mod_roots:
+        for slug in sorted(detect_mod_slugcats(m)):
+            if slug.lower() in in_chain:
+                continue
+            in_chain.add(slug.lower())
+            camps[slug] = {"chain": [slug], "source": "map suffix"}
+    return camps
+
+
+class Resolver:
+    """File lookup. Layer order (highest priority first): the game's
+    `mergedmods/world` (when given), per-mod world, then vanilla world.
+
+    `modify/world` is never a layer: it holds merge patches ([MERGE], [FIND],
+    [FILEDESTINATION], ...), not whole files. The game applies them and
+    writes the result to StreamingAssets/mergedmods (ModManager.ModMerger),
+    which AssetManager.ResolveFilePath checks before any mod (line 20).
+
+    `chain` is the slugcat inheritance chain (e.g. ["TrynsEvergreen",
+    "Saint"]). Lookup is variant-major, like the game's per-filename
+    AssetManager.ResolveFilePath (HUD/Map.cs:3567 tries `map_<r>-<slug>.txt`
+    across all mods first, then `map_<r>.txt`): every layer is searched for
+    `-<chain[0]>`, then `-<chain[1]>`, ..., then the plain name. So an
+    inherited `map_sl-saint.txt` in More Slugcats beats a plain `map_sl.txt`
+    in a higher-priority mod."""
+
+    def __init__(self, mod_roots, vanilla_root, chain=None, merged_root=None):
         self.layers = []
         self.labels = []   # parallel to self.layers; short tag for console output
+        if merged_root:
+            self.layers.append(os.path.join(merged_root, "world"))
+            self.labels.append("mergedmods")
         for m in mod_roots:
             base = os.path.basename(os.path.normpath(m))
             # Source tags use the modinfo `name` (e.g. "The Champion") rather
             # than the workshop id, so MOD[…] is recognizable at a glance. Falls
             # back to the folder name when modinfo.json is missing / malformed.
             name = _load_mod_name(m, base)
-            self.layers.append(os.path.join(m, "modify", "world"))
-            self.labels.append(f"{name}/modify")
             self.layers.append(os.path.join(m, "world"))
             self.labels.append(name)
         self.layers.append(os.path.join(vanilla_root, "world"))
         self.labels.append("vanilla")
-        self.slugcat = slugcat
+        self.chain = list(chain or [])
 
     def _variants(self, fname):
-        if not self.slugcat:
-            return [fname]
+        """[(filename, slugcat-or-None), ...] in lookup order."""
         base, ext = os.path.splitext(fname)
-        return [f"{base}-{self.slugcat}{ext}", fname]
+        return [(f"{base}-{s}{ext}", s) for s in self.chain] + [(fname, None)]
 
-    def region_file(self, region, fname):
-        for label, layer in zip(self.labels, self.layers):
-            for v in self._variants(fname):
+    def resolve_region_file(self, region, fname):
+        """(path, layer_label, matched_slugcat_or_None); Nones if absent."""
+        for v, slug in self._variants(fname):
+            for label, layer in zip(self.labels, self.layers):
                 p = os.path.join(layer, region, v)
                 if os.path.isfile(p):
-                    return p, label
-        return None, None
+                    return p, label, slug
+        return None, None, None
 
-    def room_file(self, region, room_name):
-        for label, layer in zip(self.labels, self.layers):
-            for v in self._variants(room_name.lower() + ".txt"):
+    def region_file(self, region, fname):
+        p, label, _ = self.resolve_region_file(region, fname)
+        return p, label
+
+    def resolve_room_file(self, region, room_name):
+        for v, slug in self._variants(room_name.lower() + ".txt"):
+            for label, layer in zip(self.labels, self.layers):
                 for sub in (f"{region}-rooms", "gates", "gate shelters"):
                     p = os.path.join(layer, sub, v)
                     if os.path.isfile(p):
-                        return p, label
-        return None, None
+                        return p, label, slug
+        return None, None, None
+
+    def room_file(self, region, room_name):
+        p, label, _ = self.resolve_room_file(region, room_name)
+        return p, label
 
     def regions(self):
         codes = set()
@@ -1076,7 +1280,8 @@ def optimize_layout(room_data, conn_entries, iterations=300, seed=0,
 
 
 def render_region(resolver, region, out_dir):
-    map_path, map_src = resolver.region_file(region, f"map_{region}.txt")
+    map_path, map_src, map_slug = resolver.resolve_region_file(
+        region, f"map_{region}.txt")
     if not map_path:
         return region, "skip (no map_*.txt)"
 
@@ -1336,18 +1541,29 @@ def render_region(resolver, region, out_dir):
     has_vanilla = "vanilla" in sources
     src_tag = "+".join(non_vanilla + (["vanilla"] if has_vanilla else []))
     tag = "vanilla" if src_tag == "vanilla" else f"MOD[{src_tag}]"
+    # Which map_*.txt variant was baked in: own suffix, inherited one (from
+    # the world_state chain), or the plain file.
+    variant = ""
+    if resolver.chain:
+        if map_slug is None:
+            variant = f" map={os.path.basename(map_path)}[{map_src}] (plain)"
+        elif map_slug.lower() == resolver.chain[0].lower():
+            variant = f" map={os.path.basename(map_path)}[{map_src}] (own)"
+        else:
+            variant = (f" map={os.path.basename(map_path)}[{map_src}] "
+                       f"(inherited {resolver.chain[0]}->{map_slug})")
     return region, (
         f"{tag:<24} ok ({len(room_data)}/{len(rooms_map)} rooms "
-        f"[{layer_summary}], {drawn_conn} conns) -> {out_path}{suffix}"
+        f"[{layer_summary}], {drawn_conn} conns){variant} -> {out_path}{suffix}"
     )
 
 
 def _worker(args):
-    (mod_roots, vanilla_root, slugcat, separate_layers, style, palette,
-     optimize, fix_overlaps, layout_optimize, show_title, title_font_size,
-     region, out_dir) = args
+    (mod_roots, vanilla_root, merged_root, chain, separate_layers, style,
+     palette, optimize, fix_overlaps, layout_optimize, show_title,
+     title_font_size, region, out_dir) = args
     try:
-        resolver = Resolver(mod_roots, vanilla_root, slugcat)
+        resolver = Resolver(mod_roots, vanilla_root, chain, merged_root)
         resolver.separate_layers = separate_layers
         resolver.style = style
         resolver.palette = palette
@@ -1383,6 +1599,9 @@ def main():
                         "Steam location on C:.")
     p.add_argument("--no-local-mods", action="store_true",
                    help="Skip auto-including StreamingAssets/mods/* as layers")
+    p.add_argument("--no-deps", action="store_true",
+                   help="Don't add the --mod mods' modinfo `requirements` "
+                        "(recursively) as layers below them.")
     p.add_argument("--separate-layers", action="store_true",
                    help="Also emit one SVG per canLayer: <region>_L<N>.svg")
     p.add_argument("--outline", action="store_true",
@@ -1416,9 +1635,26 @@ def main():
                         "Default: 70.")
     p.add_argument("--region", default="all",
                    help="Region code (e.g. su, dm) or 'all'")
-    p.add_argument("--slugcat", default="",
+    p.add_argument("--slugcat", action="append", default=None,
                    help="Slugcat id for campaign-specific file variants "
-                        "(e.g. map_oe-<id>.txt). Empty disables (default).")
+                        "(e.g. map_oe-<id>.txt). Repeatable. Default: every "
+                        "campaign slugcat the --mod mods offer (SlugBase "
+                        "json or map_*-<id>.txt); none without --mod.")
+    p.add_argument("--no-load-order", action="store_true",
+                   help="Ignore the game's ModLoadOrder (options file) and "
+                        "stack layers as: --mod mods, their requirements "
+                        "(dependents above dependencies, workshop above "
+                        "local), remaining local mods, vanilla.")
+    p.add_argument("--options", default=None,
+                   help="Path to Rain World's `options` file holding "
+                        "ModLoadOrder (default: %%USERPROFILE%%\AppData\\"
+                        "LocalLow\Videocult\Rain World\options).")
+    p.add_argument("--no-merged", action="store_true",
+                   help="Don't use StreamingAssets/mergedmods (the game's "
+                        "baked modify/ patches) as the top layer.")
+    p.add_argument("--no-inherit", action="store_true",
+                   help="Only use the slugcat's own `-<id>` variants; ignore "
+                        "the SlugBase world_state inheritance chain.")
     p.add_argument("--vanilla", default=None,
                    help="Override the StreamingAssets path (default: derived "
                         "from --game).")
@@ -1451,37 +1687,120 @@ def main():
     mod_args = args.mod or []
     explicit_mod_roots = [resolve_mod(m, mods_index) for m in mod_args]
     mod_roots = list(explicit_mod_roots)
+    layer_kind = {m: "selected" for m in mod_roots}
+
+    # Requirements: the game loads a mod after the mods it needs, so they sit
+    # directly below the selected mods (and above the auto-added local ones).
+    if explicit_mod_roots and not args.no_deps:
+        deps, missing, tree = resolve_requirements(
+            explicit_mod_roots, index_all_mods(workshop_root, local_mods_dir))
+        print("dependencies:")
+        for line in tree:
+            print(line)
+        if missing:
+            print(f"warning: missing required mods (not installed): "
+                  f"{', '.join(missing)}", file=sys.stderr)
+        # Code-only dependencies (SlugBase, Fisobs, ...) stay in the tree
+        # above but contribute no layer. Official (local) mods default below
+        # workshop ones — region mods are meant to override them.
+        local_norm = os.path.normcase(os.path.normpath(local_mods_dir))
+        is_local = lambda d: os.path.normcase(os.path.dirname(
+            os.path.normpath(d))) == local_norm
+        deps = ([d for d in deps if not is_local(d)] +
+                [d for d in deps if is_local(d)])
+        for d in deps:
+            if (os.path.isdir(os.path.join(d, "world")) or
+                    os.path.isdir(os.path.join(d, "modify", "world"))):
+                mod_roots.append(d)
+                layer_kind[d] = "dependency"
+    # Game options (Remix menu state): which mods are enabled and their load
+    # order. Missing file -> unknown -> fall back to the default behaviour.
+    opts_path = args.options or default_options_path()
+    enabled = read_enabled_mods(opts_path)
+    if enabled is None:
+        print(f"warning: no EnabledMods in {opts_path}; all local mods "
+              f"are layers, mergedmods is skipped", file=sys.stderr)
+
     if not args.no_local_mods and os.path.isdir(local_mods_dir):
+        norm = {os.path.normcase(os.path.normpath(m)) for m in mod_roots}
+        skipped = []
         for entry in sorted(os.listdir(local_mods_dir)):
             p = os.path.join(local_mods_dir, entry)
-            if os.path.isdir(p) and p not in mod_roots:
-                mod_roots.append(p)
+            if not os.path.isdir(p) or os.path.normcase(os.path.normpath(p)) in norm:
+                continue
+            # Disabled official mods (e.g. The Watcher) aren't in the game's
+            # world, so they're no layer either.
+            if enabled is not None and _mod_id(p) not in enabled:
+                skipped.append(_load_mod_name(p, entry))
+                continue
+            mod_roots.append(p)
+            layer_kind[p] = "local"
+        if skipped:
+            print(f"local mods disabled in game (skipped): {', '.join(skipped)}")
 
-    # Auto-detect slugcat from the explicitly-selected mods only. Local mods
-    # like moreslugcats ship files for many slugcats — auto-detecting from
-    # them would be ambiguous, so they're skipped here. Pass --slugcat to
-    # override or to pick one when several mods disagree.
-    if args.slugcat:
-        slugcat = args.slugcat
-        slugcat_source = "explicit"
-    else:
-        detected = set()
-        for m in explicit_mod_roots:
-            detected |= detect_mod_slugcats(m)
-        if len(detected) == 1:
-            slugcat = next(iter(detected))
-            slugcat_source = "auto"
-        elif len(detected) > 1:
-            raise SystemExit(
-                f"selected mods ship files for multiple slugcats: "
-                f"{sorted(detected)}. Pass --slugcat <id> to pick one."
-            )
+    # The game's own load order (Remix menu) decides who overrides whom when
+    # two mods ship the same file; use it when the options file has it.
+    order_note = "default (--mod, requirements, local)"
+    if not args.no_load_order:
+        load_order = read_mod_load_order(opts_path)
+        if load_order:
+            mod_roots, unranked = sort_by_load_order(mod_roots, load_order)
+            order_note = f"game ModLoadOrder from {opts_path}"
+            if unranked:
+                print("warning: not in ModLoadOrder (kept below ranked mods): "
+                      + ", ".join(_load_mod_name(m, os.path.basename(m))
+                                  for m in unranked), file=sys.stderr)
         else:
-            slugcat = None
-            slugcat_source = "none"
+            print(f"warning: no ModLoadOrder in {opts_path}; using default "
+                  f"layer order", file=sys.stderr)
+
+    # mergedmods = the game's own bake of every enabled mod's modify/ patches
+    # (written when mods are applied in the Remix menu). It only reflects the
+    # mods that were enabled then, so warn when a layer mod isn't enabled.
+    merged_root = None
+    merged_dir = os.path.join(vanilla_root, "mergedmods")
+    if args.no_merged:
+        pass
+    elif enabled is None:
+        pass
+    elif not os.path.isdir(os.path.join(merged_dir, "world")):
+        print(f"warning: {merged_dir} has no world/ (game never applied "
+              f"mods?); modify/ patches are not baked", file=sys.stderr)
+    else:
+        merged_root = merged_dir
+        not_enabled = [_load_mod_name(m, os.path.basename(m))
+                       for m in mod_roots if _mod_id(m) not in enabled]
+        if not_enabled:
+            print(f"warning: not enabled in game, so their modify/ patches "
+                  f"are missing from mergedmods: {', '.join(not_enabled)} "
+                  f"(enable them in the Remix menu and start the game once)",
+                  file=sys.stderr)
+
+    # Campaign slugcats offered by the selected mods. Dependencies aren't
+    # campaigns of their own here, and local mods like moreslugcats ship
+    # files for many slugcats, so neither is scanned for campaigns. Explicit
+    # --slugcat overrides; its chain still comes from a SlugBase definition
+    # in the selected mods or their dependencies when one exists.
+    offered = detect_campaign_slugcats(explicit_mod_roots)
+    if args.slugcat:
+        known = {}
+        for m in mod_roots:
+            if layer_kind[m] == "local":
+                continue
+            for sid, chain in detect_slugbase_slugcats(m).items():
+                known.setdefault(sid.lower(), (sid, chain))
+        campaigns = {}
+        for s in args.slugcat:
+            sid, chain = known.get(s.lower(), (s, [s]))
+            src = "explicit, slugbase" if s.lower() in known else "explicit"
+            campaigns[sid] = {"chain": chain, "source": src}
+    else:
+        campaigns = offered
+    if args.no_inherit:
+        campaigns = {k: dict(v, chain=v["chain"][:1]) for k, v in campaigns.items()}
     os.makedirs(args.out, exist_ok=True)
 
-    resolver = Resolver(mod_roots, vanilla_root, slugcat)
+    resolver = Resolver(mod_roots, vanilla_root)
     available = resolver.regions()
     if args.region.lower() == "all":
         regions = available
@@ -1491,11 +1810,32 @@ def main():
             print(f"warning: '{regions[0]}' not in any layer", file=sys.stderr)
 
     print(f"game:    {args.game}")
-    print(f"mods:    {mod_roots}")
-    print(f"vanilla: {vanilla_root}")
-    slugcat_tag = (f"{slugcat} (auto)" if slugcat_source == "auto"
-                   else str(slugcat))
-    print(f"slugcat: {slugcat_tag}")
+    print(f"layers (highest priority first; order: {order_note}):")
+    if merged_root:
+        print(f"  {'merged':<10}  game-baked modify/ patches  -> {merged_root}")
+    for m in mod_roots:
+        print(f"  {layer_kind[m]:<10}  {_load_mod_name(m, os.path.basename(m))}"
+              f"  -> {m}")
+    print(f"  {'vanilla':<10}  {vanilla_root}")
+    if not campaigns:
+        print("slugcat: none (plain map files only)")
+    for sid, info in campaigns.items():
+        chain = " -> ".join(info["chain"] + ["plain"])
+        print(f"slugcat: {sid} [{info['source']}]  lookup: {chain}")
+    # One campaign (the common case) is baked straight into --out. Several
+    # campaigns can't share one map, so each gets its own subfolder.
+    if len(campaigns) > 1:
+        print(f"info: {len(campaigns)} campaign slugcats "
+              f"({', '.join(campaigns)}) -> one folder each under {args.out}"
+              f" (use --slugcat <id> to pick one)")
+        targets = [(info["chain"], os.path.join(args.out, sid))
+                   for sid, info in campaigns.items()]
+    elif campaigns:
+        targets = [(next(iter(campaigns.values()))["chain"], args.out)]
+    else:
+        targets = [([], args.out)]
+    for _chain, out_dir in targets:
+        os.makedirs(out_dir, exist_ok=True)
     print(f"regions: {regions}")
     print(f"out:     {args.out}\n")
 
@@ -1508,13 +1848,16 @@ def main():
                           "(the spring pass can itself introduce overlaps)")
 
     optimize = not args.no_optimize
-    work = [(mod_roots, vanilla_root, slugcat, args.separate_layers, style,
+    work = [(mod_roots, vanilla_root, merged_root, chain,
+             args.separate_layers, style,
              palette, optimize, args.fix_overlaps, args.optimize,
-             not args.no_title, args.title_font_size, r, args.out)
-            for r in regions]
+             not args.no_title, args.title_font_size, r, out_dir)
+            for chain, out_dir in targets for r in regions]
+    multi = len(targets) > 1
     with ProcessPoolExecutor() as ex:
-        for region, msg in ex.map(_worker, work):
-            print(f"[{region:>4}] {msg}")
+        for w, (region, msg) in zip(work, ex.map(_worker, work)):
+            prefix = f"{w[3][0]}/" if multi else ""
+            print(f"[{prefix}{region:>4}] {msg}")
 
 
 if __name__ == "__main__":
