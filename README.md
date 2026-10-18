@@ -80,9 +80,17 @@ overrides the choice; `--no-inherit` drops the chain.
 wins. So Evergreen's SL map is MSC's `map_sl-saint.txt` (with the SL_SCRUSHED
 shelter) even though no Evergreen file exists for SL.
 
-`world_<region>.txt` is only used to discover regions; its room conditions
-(`EXCLUSIVEROOM`, `HIDEROOM`, …) are not evaluated — the map file decides
-which rooms are drawn.
+The map file decides which rooms are drawn, with one exception. A campaign
+map (`map_<region>-<slugcat>.txt`, own or inherited) can predate rooms that
+other mods patch into the plain `map_<region>.txt`. The game still loads them
+from `world_<region>.txt`; only its map omits them. Example: Evergreen's
+`map_sb-TrynsEvergreen.txt` lacks Forsaken Station's `SB_SE01`–`04` and
+`GATE_FT_SB`. Such rooms are copied from the plain map when
+`world_<region>.txt` keeps them for the slugcat: the room line passes its
+`(a,b)` / `(X-a,b)` filter, and the room is not `HIDEROOM`ed for it or
+`EXCLUSIVEROOM` to another slugcat. These are the same rooms the dev-tools
+map writer would save. They are shifted by the median devPos offset between
+the two maps' shared rooms, and their `Connection:` lines come along.
 
 ## Console output
 
@@ -101,6 +109,13 @@ Each region line is prefixed with a source tag derived from which layers actuall
 When a slugcat is active the line also names the map file that was baked in
 and why: `map=map_sl-Saint.txt[More Slugcats Expansion] (inherited TrynsEvergreen->Saint)`,
 `(own)` for the slugcat's own variant, `(plain)` for the unsuffixed file.
+Rooms filled in from the plain map are appended:
+`+5 rooms from map_sb.txt[mergedmods]`.
+
+After the region lines a closing summary repeats what the early `info:` line
+said, where it can't scroll away: with several campaigns, each campaign's
+folder; and campaigns the `--mod` mods offer that a `--slugcat` choice left
+out.
 
 Source labels use the `name` field from each mod's `modinfo.json` (e.g. `The Champion`, `More Slugcats Expansion`). Falls back to the workshop ID / folder name when `modinfo.json` is missing or malformed.
 

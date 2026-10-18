@@ -44,8 +44,11 @@ File types consumed per region:
 
 - `map_<region>.txt` (or `map_<region>-<slugcat>.txt`) — room placement
   (`devPos`/`canPos`) and `Connection:` lines (shortcut endpoints).
-- `world_<region>.txt` — only its presence (region discovery); contents
-  are not parsed.
+- `world_<region>.txt` — presence (region discovery). When a campaign map
+  variant is used, also its `ROOMS` (with `(…)` timeline filters) and
+  `HIDEROOM` / `EXCLUSIVEROOM` lines (`world_map_rooms`). They select which
+  plain-map rooms the variant lacks get filled in (`merge_plain_rooms`). The
+  timeline is `chain[0]`, matched case-insensitively.
 - `<region>-rooms/<roomname>.txt` (or `gates/`, `gate shelters/`) — per-room
   tile geometry.
 - `DisplayName.txt` — in-game region name, same layer/slugcat resolution as
@@ -65,6 +68,10 @@ not fatal.
 - `out/<region>_L<N>.svg` — one per `canLayer`, only with `--separate-layers`.
 - Console: one line per region, prefixed with a source tag (`vanilla` /
   `MOD[<a>+<b>+vanilla]`) and a `(w×h [L0:n,...], N conns) -> path` summary.
+  With a slugcat, also `map=<file>[<layer>] (own|inherited …|plain)` and
+  `+N rooms from map_<r>.txt[<layer>]` when rooms were filled in. A closing
+  summary (`campaign_summary`) lists one folder per campaign when there are
+  several, and names offered campaigns that `--slugcat` left out.
   `--optimize` adds a `layout optimize: ... -> ...` line to stderr per
   region.
 
@@ -242,6 +249,7 @@ guaranteed-crossing-free layout; all reduce, not eliminate, the problem.
 | `mapper_vpsc.py` | Full copy of `mapper.py` with constrained-stress-majorization + parameter-search layout optimization. |
 | `mapper_springs.py` | Full copy of `mapper.py` with spring-embedder layout optimization (reference/comparison). |
 | `tests/test_resolution.py` | unittest: requirements, load order / EnabledMods, slugcat chains, Resolver lookup. `python -m unittest discover -s tests` |
+| `tests/test_campaign_map.py` | unittest: world-file room filtering, filling a campaign map from the plain map, closing campaign summary. |
 | `README.md` | User-facing usage guide. |
 | `CONVO.md` | Narrative design history (why decisions were made, in dialogue form). |
 | `SPECIFICATION.md` | This file — formal contract/reference. |

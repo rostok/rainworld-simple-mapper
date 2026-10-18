@@ -137,6 +137,13 @@ class TestResolver(Fixture):
         path, label, variant = r.resolve_region_file("hi", "map_hi.txt")
         self.assertEqual((label, variant), ("dep", None))
 
+    def test_plain_only_skips_variants(self):
+        r = self._resolver(["Camp", "Saint"])
+        path, label, variant = r.resolve_region_file("sb", "map_sb.txt",
+                                                     plain_only=True)
+        self.assertTrue(path.lower().endswith("map_sb.txt"))
+        self.assertEqual((label, variant), ("dep", None))
+
     def test_modify_is_not_a_layer(self):
         # modify/ holds merge patches, never whole files.
         _write(os.path.join(self.camp, "modify", "world", "hi", "map_hi.txt"),

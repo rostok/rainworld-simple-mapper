@@ -15,6 +15,7 @@ import html
 import json
 import os
 import re
+import statistics
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
@@ -397,9 +398,11 @@ class Resolver:
         base, ext = os.path.splitext(fname)
         return [(f"{base}-{s}{ext}", s) for s in self.chain] + [(fname, None)]
 
-    def resolve_region_file(self, region, fname):
-        """(path, layer_label, matched_slugcat_or_None); Nones if absent."""
-        for v, slug in self._variants(fname):
+    def resolve_region_file(self, region, fname, plain_only=False):
+        """(path, layer_label, matched_slugcat_or_None); Nones if absent.
+        `plain_only` skips the `-<slugcat>` variants."""
+        variants = [(fname, None)] if plain_only else self._variants(fname)
+        for v, slug in variants:
             for label, layer in zip(self.labels, self.layers):
                 p = os.path.join(layer, region, v)
                 if os.path.isfile(p):
@@ -502,6 +505,68 @@ def parse_map_file(path):
             sub = fields[5]
         rooms[name] = (x, y, layer, sub)
     return rooms, connections
+
+
+def _timeline_listed(spec, timeline):
+    """`timeline` is in the comma list `spec` (case-insensitive: suffix-only
+    campaigns come lower-cased from file names)."""
+    return any(s.strip().lower() == timeline.lower() for s in spec.split(","))
+
+
+def world_map_rooms(path, timeline):
+    """Rooms of world_<region>.txt that `timeline`'s map may show: ROOMS lines
+    passing their `(a,b)` / `(X-a,b)` filter (WorldLoader.cs:62,105), minus
+    DisabledMapRooms — HIDEROOM for this timeline, EXCLUSIVEROOM for others
+    (WorldLoader.cs:916). The dev-tools map writer skips the same rooms
+    (DevInterface/MapPage.cs:1224)."""
+    rooms, hidden = set(), set()
+    section = None
+    for raw in read_lines(path):
+        s = raw.strip()
+        if s in ("CONDITIONAL LINKS", "ROOMS"):
+            section = s
+            continue
+        if s.startswith("END "):
+            section = None
+            continue
+        if not section or not s or s.startswith("//"):
+            continue
+        if s.startswith("(") and ")" in s:
+            spec = s[1:s.index(")")]
+            neg = spec.startswith("X-")
+            if _timeline_listed(spec[2:] if neg else spec, timeline) == neg:
+                continue
+            s = s[s.index(")") + 1:]
+        if s.startswith("{") and "}" in s:
+            s = s[s.index("}") + 1:]  # custom conditions: can't evaluate, keep
+        f = [v.strip() for v in s.split(" : ")]
+        if section == "ROOMS":
+            rooms.add(f[0].upper())
+        elif len(f) >= 3 and f[1] in ("HIDEROOM", "EXCLUSIVEROOM"):
+            if _timeline_listed(f[0], timeline) == (f[1] == "HIDEROOM"):
+                hidden.add(f[2].upper())
+    return rooms - hidden
+
+
+def merge_plain_rooms(rooms, conns, plain_rooms, plain_conns, keep):
+    """Add to a campaign map (`rooms`, `conns` of map_<r>-<slug>.txt) the
+    plain map's rooms it lacks but `keep` allows — e.g. Forsaken Station's
+    SB_SE* and GATE_FT_SB, absent from The Evergreen's own map_sb. Both maps
+    place shared rooms with one devPos offset, so new rooms are shifted by
+    the median offset of the shared ones. Returns the added names; none
+    without shared rooms to align on."""
+    shared = [n for n in rooms if n in plain_rooms]
+    new = sorted(n for n in plain_rooms if n not in rooms and n in keep)
+    if not shared or not new:
+        return []
+    dx = statistics.median(rooms[n][0] - plain_rooms[n][0] for n in shared)
+    dy = statistics.median(rooms[n][1] - plain_rooms[n][1] for n in shared)
+    for n in new:
+        x, y, layer, sub = plain_rooms[n]
+        rooms[n] = (x + dx, y + dy, layer, sub)
+    added = set(new)
+    conns.extend(c for c in plain_conns if c[0] in added or c[1] in added)
+    return new
 
 
 def parse_room_geometry(path):
@@ -1288,6 +1353,22 @@ def render_region(resolver, region, out_dir):
     rooms_map, conn_entries = parse_map_file(map_path)
     sources = {map_src}
 
+    # A campaign map can predate rooms other mods patch into the plain map;
+    # the game still loads them from world_<r>.txt, only the map omits them.
+    added, plain_src = [], None
+    if map_slug is not None:
+        plain_path, plain_src, _ = resolver.resolve_region_file(
+            region, f"map_{region}.txt", plain_only=True)
+        world_path, _w_src, _ = resolver.resolve_region_file(
+            region, f"world_{region}.txt", plain_only=True)
+        if plain_path and world_path:
+            plain_rooms, plain_conns = parse_map_file(plain_path)
+            added = merge_plain_rooms(
+                rooms_map, conn_entries, plain_rooms, plain_conns,
+                world_map_rooms(world_path, resolver.chain[0]))
+            if added:
+                sources.add(plain_src)
+
     # In-game display name, e.g. "Garbage Wastes" — World/<region>/DisplayName.txt,
     # same layer+slugcat resolution as map_*.txt (Region.cs:617 GetRegionFullName).
     display_path, _dn_src = resolver.region_file(region, "DisplayName.txt")
@@ -1552,10 +1633,32 @@ def render_region(resolver, region, out_dir):
         else:
             variant = (f" map={os.path.basename(map_path)}[{map_src}] "
                        f"(inherited {resolver.chain[0]}->{map_slug})")
+    if added:
+        variant += (f" +{len(added)} rooms from map_{region}.txt"
+                    f"[{plain_src}]")
     return region, (
         f"{tag:<24} ok ({len(room_data)}/{len(rooms_map)} rooms "
         f"[{layer_summary}], {drawn_conn} conns){variant} -> {out_path}{suffix}"
     )
+
+
+def campaign_summary(rendered, offered):
+    """Closing lines, so they aren't buried under the per-region log.
+    `rendered`: [(slugcat, out_dir)]; `offered`: campaign ids the --mod mods
+    offer. Lists each folder when there are several and names offered
+    campaigns a --slugcat choice left out."""
+    lines = []
+    if len(rendered) > 1:
+        lines.append(f"campaigns ({len(rendered)}), one folder each:")
+        w = max(len(s) for s, _ in rendered)
+        lines += [f"  {s:<{w}}  -> {d}" for s, d in rendered]
+    done = {s.lower() for s, _ in rendered}
+    rest = [s for s in offered if s.lower() not in done]
+    if rest:
+        lines.append(f"info: the --mod mods also offer {', '.join(rest)} "
+                     f"(not rendered; drop --slugcat to render all, one "
+                     f"folder each)")
+    return lines
 
 
 def _worker(args):
@@ -1858,6 +1961,10 @@ def main():
         for w, (region, msg) in zip(work, ex.map(_worker, work)):
             prefix = f"{w[3][0]}/" if multi else ""
             print(f"[{prefix}{region:>4}] {msg}")
+    summary = campaign_summary(
+        [(sid, d) for sid, (_c, d) in zip(campaigns, targets)], offered)
+    if summary:
+        print("\n" + "\n".join(summary))
 
 
 if __name__ == "__main__":
