@@ -1750,8 +1750,8 @@ def main():
                         "local), remaining local mods, vanilla.")
     p.add_argument("--options", default=None,
                    help="Path to Rain World's `options` file holding "
-                        "ModLoadOrder (default: %%USERPROFILE%%\AppData\\"
-                        "LocalLow\Videocult\Rain World\options).")
+                        "ModLoadOrder (default: %%USERPROFILE%%\\AppData\\"
+                        "LocalLow\\Videocult\\Rain World\\options).")
     p.add_argument("--no-merged", action="store_true",
                    help="Don't use StreamingAssets/mergedmods (the game's "
                         "baked modify/ patches) as the top layer.")
