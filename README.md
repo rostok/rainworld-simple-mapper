@@ -25,6 +25,10 @@ python mapper.py --outline                    # cream-bg wireframe style instead
 python mapper.py --invert                     # invert every colour in the palette
 python mapper.py --no-optimize                # one rect per solid-tile row (legacy output) instead of merged paths
 python mapper.py --fix-overlaps --optimize    # Kamada-Kawai layout pass to shorten connections, then de-overlap
+python mapper.py --mod drought --changes      # report: how each region differs from vanilla + DLC (no SVGs)
+python mapper.py --mod drought --changes --changes-json d.json   # + every per-room detail as JSON
+python mapper.py --mod drought --only-changed # SVGs only for regions that differ from the baseline
+python mapper.py --mod drought --show-changed # tint rooms by change status + legend (combine with --only-changed)
 ```
 
 `--mod` accepts a workshop id, an absolute path, or a substring of the id or
@@ -42,6 +46,76 @@ a browser or convert with ImageMagick:
 ```
 magick out/su.svg -density 200 out/su.png
 ```
+
+## Change metrics vs vanilla (`--changes`, `--only-changed`, `--show-changed`)
+
+Code: `mapdiff.py`. Tests: `tests/test_mapdiff.py`.
+
+**Baseline** = vanilla + the enabled local mods (More Slugcats, Watcher, …)
+with *only their own* `modify/world` patches applied. The game's `mergedmods`
+can't be used for it: it mixes in every enabled workshop mod's patches. So
+`mapdiff.build_baseline_merged` re-applies the DLC patches into
+`.cache/baseline-merged/`, a port of the game's `ModMerger` (`ModManager.cs`):
+`[FIND*]/[REPLACE*]/[ADD*]` line edits and the `[MERGE]` mergers for
+`world_*.txt`, `*_settings*.txt`, `properties.txt` and `map_*.txt`. Checked
+against the real `mergedmods`: 389/391 baked files are identical; the other 2
+are files that enabled workshop mods also patch. Not ported:
+`[FILEDESTINATION]` (6 sub-patches, reported in the console) and map PNGs.
+With `--no-merged` the baseline skips patches too, so both sides match.
+The baseline takes every layer from `StreamingAssets/mods` except a `--mod`,
+including local mods pulled in as a `--mod`'s requirement (e.g. More Slugcats
+for The Bestowed).
+
+**Modded side.** With `--mod`, the diff doesn't read the game's
+`mergedmods`: that folder carries the patches of *every* enabled workshop
+mod (e.g. The Bestowed's `DM_REALGATE`, Pilgrims' Ascent's UW edits), which
+would be blamed on the `--mod`, and it lacks the `--mod`'s own patches when
+the mod is disabled in the game. Instead the patches of the mapper's layers
+(DLC + `--mod` + requirements) are baked into `.cache/mod-merged/` with the
+same merger. Without `--mod` the modded side is the whole current game
+(real `mergedmods`). Regions whose comparison fails are listed under
+`NOT COMPARED` in the report.
+
+Both sides go through the same `Resolver` and slugcat chain, so the diff
+compares what the game would load for that campaign. Per region, each
+dimension is a 0..1 distance:
+
+| Dimension | Source | Measure |
+|---|---|---|
+| rooms (20%) | `world_<r>.txt` ROOMS, timeline-filtered, HIDEROOM/EXCLUSIVEROOM applied | 1 − Jaccard of room names |
+| geometry (30%) | room files, tile grid | changed tiles / total area (new and removed rooms count fully; size changes count the difference) |
+| connections (15%) | ROOMS connection lists (+ substitute links) | 1 − Jaccard of room-pair edges |
+| creatures (20%) | CREATURES, timeline-filtered | 1 − Σmin/Σmax over (room, creature) counts; LINEAGE = 1 per den |
+| objects (10%) | `<room>_settings.txt` PlacedObjects | same multiset distance over (room, object type) |
+| layout (2.5%) | `map_<r>.txt` devPos / layer | share of shared rooms that moved, after removing the median whole-map shift |
+| properties (2.5%) | `properties.txt` | 1 − Jaccard of lines |
+
+**Score** = weighted sum. **Class**: `new` (region not in baseline),
+`same` (nothing differs), `tweaked` (score < 10%), `reworked`.
+
+**Room status**: `new`, `new-copy`, `new-derived`, `geometry`, `moved`,
+`content` (creatures / objects / connections / tag), `same`, `removed`.
+
+**Where new rooms come from.** Every baseline room (vanilla + DLC, ~3.4k) gets
+a fingerprint: an exact hash of its tile grid plus a 24×24 air-occupancy
+bitmap. A room new to a region is matched against all of them: identical →
+`new-copy` (e.g. a gate copied from `GATE_UW_LC`); bitmap Jaccard ≥ 0.85
+between rooms within 25% of each other's size → `new-derived`; else original.
+Fingerprints are cached per file in `.cache/room-index.pkl` (the first run
+parses all rooms, ~12 s).
+
+`--changes` output: one row per region (class, score, room counts
+`+new/-removed/~changed/=same`, every dimension, new-room origins by source
+region), then a mod summary: rooms that are new original / copied or derived
+from baseline / changed baseline / untouched baseline / removed.
+
+`--show-changed` tints rooms (45% opacity, under the geometry) by status,
+outlines removed rooms with a dashed red frame at their baseline position,
+and adds a legend with the region's class and score. Hovering a room in a
+browser shows its details (source room, % tiles changed, creature deltas).
+Without the flag the SVG colours are unchanged. `--only-changed` skips
+regions whose class is `same`; the per-region log line ends with
+`[class score]`.
 
 ## Baking: what goes into a map
 

@@ -616,6 +616,24 @@ def _svg_y(ll_y, ty_grid):
     return -(ll_y + ty_grid * TILE_UNITS)
 
 
+def _header_shift(header_rects, elem_rects, margin=6.0):
+    """Extra top space needed so the header clears the map content.
+
+    Rects are (x0, y0, x1, y1) in SVG coords (y down), header_rects placed at
+    the un-shifted top of the map. Only elements that horizontally overlap a
+    header rect and reach into it (within `margin`) force a shift; returns 0
+    when nothing collides. Raising the header by the returned amount (i.e.
+    moving everything below it down) puts it `margin` above the worst offender.
+    Moving it up cannot create new collisions.
+    """
+    shift = 0.0
+    for hx0, _hy0, hx1, hy1 in header_rects:
+        for ex0, ey0, ex1, _ey1 in elem_rects:
+            if ex0 < hx1 and ex1 > hx0 and ey0 - margin < hy1:
+                shift = max(shift, hy1 - (ey0 - margin))
+    return shift
+
+
 def _emit_filled(out, tiles, ll_x, ll_y, palette):
     """Filled style: rect runs for solid; triangles for slopes (only the
     diagonal is exposed — the right-angle sides abut solid neighbors and
@@ -1344,7 +1362,11 @@ def optimize_layout(room_data, conn_entries, iterations=300, seed=0,
         )
 
 
-def render_region(resolver, region, out_dir):
+def render_region(resolver, region, out_dir, changes=None):
+    """`changes`: a mapdiff.diff_region result. When given (--show-changed),
+    rooms are tinted by change status, removed rooms are drawn as dashed
+    outlines at their baseline position, and a legend is added. None keeps
+    the normal colours."""
     map_path, map_src, map_slug = resolver.resolve_region_file(
         region, f"map_{region}.txt")
     if not map_path:
@@ -1468,6 +1490,21 @@ def render_region(resolver, region, out_dir):
                 if rx1 > max_x:  max_x = rx1
                 if ry1 > max_y:  max_y = ry1
 
+    # --show-changed: removed rooms are outlined at their baseline devPos,
+    # so the bounding box must cover them too.
+    removed_rects = []   # (name, ll_x, ll_y, w, h)
+    if changes:
+        for n in changes.get("removed", []):
+            pos = changes.get("base_map", {}).get(n)
+            size = changes.get("base_size", {}).get(n)
+            if not pos or not size:
+                continue
+            removed_rects.append((n, pos[0], pos[1], size[0], size[1]))
+            min_x = min(min_x, pos[0])
+            min_y = min(min_y, pos[1])
+            max_x = max(max_x, pos[0] + size[0] * TILE_UNITS)
+            max_y = max(max_y, pos[1] + size[1] * TILE_UNITS)
+
     layer_counts = {}
     for (_w, _h, _x, _y, _t, layer, _cx, _cy) in room_data.values():
         layer_counts[layer] = layer_counts.get(layer, 0) + 1
@@ -1489,6 +1526,9 @@ def render_region(resolver, region, out_dir):
     label_color = palette["label"]
     room_bg = palette.get("room_bg")
 
+    if changes:
+        import mapdiff  # lazy: mapdiff imports mapper
+    status_seen = set()
     for name, (w, h, ll_x, ll_y, tiles, layer, cx, cy) in room_data.items():
         rects = layer_geo.setdefault(layer, [])
         if room_bg:
@@ -1497,6 +1537,16 @@ def render_region(resolver, region, out_dir):
                 f'width="{w * TILE_UNITS:.2f}" '
                 f'height="{h * TILE_UNITS:.2f}" '
                 f'fill="{room_bg}"/>'
+            )
+        info = changes["rooms"].get(name) if changes else None
+        if info and info["status"] in mapdiff.STATUS_STYLE:
+            status_seen.add(info["status"])
+            tip = html.escape(mapdiff.room_tooltip(name, info))
+            rects.append(
+                f'<rect x="{ll_x:.2f}" y="{_svg_y(ll_y, h):.2f}" '
+                f'width="{w * TILE_UNITS:.2f}" height="{h * TILE_UNITS:.2f}" '
+                f'fill="{mapdiff.STATUS_STYLE[info["status"]][0]}" '
+                f'fill-opacity="0.45"><title>{tip}</title></rect>'
             )
         if style == "filled":
             if getattr(resolver, "optimize", True):
@@ -1549,16 +1599,48 @@ def render_region(resolver, region, out_dir):
             connections.append((line, {room_data[a][5], room_data[b][5]}))
 
     pad = 30
+    title_font_size = getattr(resolver, "title_font_size", 70)
+    show_title = getattr(resolver, "show_title", True)
+    title_band = (title_font_size + 2) if show_title else 0
+    title_label = f"{display_name} ({region.upper()})"
+    # --show-changed legend sits right below the title: one row per status
+    # present plus the summary line (see legend_lines below).
+    legend_fs = max(8.0, title_font_size * 0.35)
+    legend_texts = []
+    if changes:
+        legend_texts = [mapdiff.STATUS_STYLE[st][1] for st in mapdiff.STATUS_STYLE
+                        if st in status_seen or (st == "removed" and removed_rects)]
+        legend_texts.append(
+            f'{changes["class"]}  score {changes["score"]:.1%}  (hover rooms for details)')
+    legend_band = legend_fs * 1.5 * len(legend_texts)
     vb_x = min_x - pad
-    vb_y = -max_y - pad
+    base_top = -max_y - pad     # top edge when the header needs no extra room
+    # The header is drawn top-left over the padding. Only if it actually runs
+    # into rooms (monospace: advance ~0.6 * font size) is the map pushed down
+    # (viewBox grown upward); with no collision nothing is moved.
+    hx0 = vb_x + 6
+    header_rects = []
+    if show_title:
+        header_rects.append((hx0, base_top,
+                             hx0 + len(title_label) * 0.6 * title_font_size,
+                             base_top + title_band))
+    if legend_texts:
+        legend_w = legend_fs * 1.4 + max(len(t) for t in legend_texts) * 0.6 * legend_fs
+        header_rects.append((hx0, base_top + title_band,
+                             hx0 + legend_w, base_top + title_band + legend_band))
+    elem_rects = [(lx, _svg_y(ly, hh), lx + ww * TILE_UNITS, -ly)
+                  for (ww, hh, lx, ly, *_rest) in room_data.values()]
+    elem_rects += [(rx, _svg_y(ry, rh), rx + rw * TILE_UNITS, -ry)
+                   for (_n, rx, ry, rw, rh) in removed_rects]
+    top_band = _header_shift(header_rects, elem_rects)
+    vb_y = base_top - top_band
     vb_w = (max_x - min_x) + 2 * pad
-    vb_h = (max_y - min_y) + 2 * pad
+    vb_h = (max_y - min_y) + 2 * pad + top_band
     viewbox = f"{vb_x:.1f} {vb_y:.1f} {vb_w:.1f} {vb_h:.1f}"
     bg_rect = (
         f'<rect x="{vb_x:.1f}" y="{vb_y:.1f}" width="{vb_w:.1f}" '
         f'height="{vb_h:.1f}" fill="{palette["bg"]}"/>'
     )
-    title_font_size = getattr(resolver, "title_font_size", 70)
     title_text = (
         f'<text x="{vb_x + 6:.1f}" y="{vb_y + title_font_size + 2:.1f}" '
         f'font-size="{title_font_size}" '
@@ -1567,6 +1649,46 @@ def render_region(resolver, region, out_dir):
     )
 
     all_layers = sorted(set(list(layer_geo) + list(layer_marks) + list(layer_labels)))
+
+    # --show-changed extras: removed-room outlines and a legend.
+    change_lines, legend_lines = [], []
+    if changes:
+        red = mapdiff.STATUS_STYLE["removed"][0]
+        for n, rx, ry, rw, rh in removed_rects:
+            tip = html.escape(mapdiff.room_tooltip(n, changes["rooms"][n]))
+            change_lines.append(
+                f'<rect x="{rx:.2f}" y="{_svg_y(ry, rh):.2f}" '
+                f'width="{rw * TILE_UNITS:.2f}" height="{rh * TILE_UNITS:.2f}" '
+                f'fill="none" stroke="{red}" stroke-width="1.2" '
+                f'stroke-dasharray="3 2"><title>{tip}</title></rect>')
+            change_lines.append(
+                f'<text x="{rx + rw * TILE_UNITS / 2:.1f}" '
+                f'y="{-(ry + rh * TILE_UNITS / 2):.1f}" font-size="6" '
+                f'fill="{red}" text-anchor="middle" '
+                f'font-family="monospace">{n}</text>')
+        if removed_rects:
+            status_seen.add("removed")
+        fs = legend_fs
+        top = vb_y + title_band
+        i = 0
+        for st, (color, text) in mapdiff.STATUS_STYLE.items():
+            if st not in status_seen:
+                continue
+            y = top + fs * 1.5 * (i + 1)
+            fill = (f'fill="none" stroke="{color}" stroke-width="1.2" stroke-dasharray="3 2"'
+                    if st == "removed" else f'fill="{color}" fill-opacity="0.8"')
+            legend_lines.append(
+                f'<rect x="{vb_x + 6:.1f}" y="{y - fs * 0.85:.1f}" '
+                f'width="{fs:.1f}" height="{fs:.1f}" {fill}/>')
+            legend_lines.append(
+                f'<text x="{vb_x + 6 + fs * 1.4:.1f}" y="{y:.1f}" '
+                f'font-size="{fs:.1f}" fill="{label_color}" '
+                f'font-family="monospace">{html.escape(text)}</text>')
+            i += 1
+        legend_lines.append(
+            f'<text x="{vb_x + 6:.1f}" y="{top + fs * 1.5 * (i + 1):.1f}" '
+            f'font-size="{fs:.1f}" fill="{label_color}" font-family="monospace">'
+            f'{changes["class"]}  score {changes["score"]:.1%}  (hover rooms for details)</text>')
 
     def write_svg(path, render_layers, conn_filter=None):
         """render_layers: ordered list of layer ints (back-to-front).
@@ -1589,6 +1711,8 @@ def render_region(resolver, region, out_dir):
                     if chunk:
                         f.write("\n".join(chunk) + "\n")
                 f.write("</g>\n")
+            if change_lines:
+                f.write('<g id="changes">\n' + "\n".join(change_lines) + "\n</g>\n")
             # Connections on top of all geometry, never dimmed.
             conn_lines = [
                 ln for (ln, touched) in connections
@@ -1602,6 +1726,8 @@ def render_region(resolver, region, out_dir):
                 label_lines.extend(layer_labels.get(layer, []))
             if label_lines:
                 f.write('<g id="labels">\n' + "\n".join(label_lines) + "\n</g>\n")
+            if legend_lines:
+                f.write('<g id="legend">\n' + "\n".join(legend_lines) + "\n</g>\n")
             f.write("</svg>\n")
         return len(conn_lines)
 
@@ -1661,11 +1787,49 @@ def campaign_summary(rendered, offered):
     return lines
 
 
+_ROOM_INDEX = None   # mapdiff fingerprint index, set per worker process
+
+
+def _init_worker(room_index):
+    global _ROOM_INDEX
+    _ROOM_INDEX = room_index
+
+
+def _diff(diff_cfg, mod_roots, vanilla_root, merged_root, chain, region):
+    """mapdiff.diff_region for one region: modded layers vs the baseline
+    (enabled local mods + vanilla, DLC patches from diff_cfg's cache)."""
+    import mapdiff
+    mod_res = Resolver(mod_roots, vanilla_root, chain,
+                       diff_cfg.get("mod_merged", merged_root))
+    base_res = Resolver(diff_cfg["base_roots"], vanilla_root, chain,
+                        diff_cfg["base_merged"])
+    return mapdiff.diff_region(mod_res, base_res, region, _ROOM_INDEX)
+
+
+def _diff_worker(args):
+    diff_cfg, mod_roots, vanilla_root, merged_root, chain, region = args
+    try:
+        return region, _diff(diff_cfg, mod_roots, vanilla_root, merged_root,
+                             chain, region)
+    except Exception as e:
+        return region, {"error": f"{type(e).__name__}: {e}"}
+
+
 def _worker(args):
     (mod_roots, vanilla_root, merged_root, chain, separate_layers, style,
      palette, optimize, fix_overlaps, layout_optimize, show_title,
-     title_font_size, region, out_dir) = args
+     title_font_size, region, out_dir, diff_cfg, only_changed,
+     show_changed) = args
     try:
+        changes, note = None, ""
+        if diff_cfg:
+            d = _diff(diff_cfg, mod_roots, vanilla_root, merged_root, chain, region)
+            if d:
+                note = f" [{d['class']} {d['score']:.1%}]"
+            if only_changed and (d is None or d["class"] == "same"):
+                return region, "skip (unchanged vs baseline)"
+            if show_changed:
+                changes = d
         resolver = Resolver(mod_roots, vanilla_root, chain, merged_root)
         resolver.separate_layers = separate_layers
         resolver.style = style
@@ -1675,7 +1839,8 @@ def _worker(args):
         resolver.layout_optimize = layout_optimize
         resolver.show_title = show_title
         resolver.title_font_size = title_font_size
-        return render_region(resolver, region, out_dir)
+        region, msg = render_region(resolver, region, out_dir, changes=changes)
+        return region, msg + note
     except Exception as e:
         return region, f"error: {type(e).__name__}: {e}"
 
@@ -1764,6 +1929,24 @@ def main():
     p.add_argument("--workshop", default=None,
                    help="Override the workshop content path used to resolve "
                         "bare workshop IDs (default: derived from --game).")
+    p.add_argument("--changes", action="store_true",
+                   help="Print how each region differs from the baseline "
+                        "(vanilla + enabled DLC with their modify/ patches): "
+                        "class, score and per-dimension change (rooms, "
+                        "geometry, connections, creatures, objects, layout, "
+                        "properties), plus where new rooms come from. No "
+                        "SVGs are written.")
+    p.add_argument("--changes-json", default=None, metavar="PATH",
+                   help="With --changes: also write every per-room detail "
+                        "as JSON to PATH.")
+    p.add_argument("--only-changed", action="store_true",
+                   help="Render SVGs only for regions that differ from the "
+                        "baseline.")
+    p.add_argument("--show-changed", action="store_true",
+                   help="Tint rooms in the SVGs by change status vs the "
+                        "baseline (new / copied / derived / geometry / "
+                        "moved / content), outline removed rooms, add a "
+                        "legend. Without it the colours are unchanged.")
     p.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "out"))
     args = p.parse_args()
 
@@ -1940,7 +2123,81 @@ def main():
     for _chain, out_dir in targets:
         os.makedirs(out_dir, exist_ok=True)
     print(f"regions: {regions}")
-    print(f"out:     {args.out}\n")
+    if not args.changes:
+        print(f"out:     {args.out}")
+
+    # Baseline for --changes / --only-changed / --show-changed: the enabled
+    # local mods (DLC) + vanilla, with only their own modify/ patches baked
+    # (the game's mergedmods mixes in every enabled workshop mod's patches).
+    diff_cfg, room_index = None, None
+    if args.changes or args.only_changed or args.show_changed:
+        import mapdiff
+        # Every layer from StreamingAssets/mods except an explicit --mod:
+        # a local mod (MSC) pulled in as a --mod's requirement is labelled
+        # "dependency" but is still part of the baseline game.
+        local_norm = os.path.normcase(os.path.normpath(local_mods_dir))
+        base_roots = [m for m in mod_roots if layer_kind[m] != "selected" and
+                      os.path.normcase(os.path.dirname(os.path.normpath(m))) == local_norm]
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+        base_merged = None
+        if merged_root:
+            base_merged, st = mapdiff.build_baseline_merged(
+                base_roots, vanilla_root, os.path.join(cache_dir, "baseline-merged"))
+            note = f"{st['files']} modify/ patch files baked"
+            if st["unsupported"]:
+                note += f" (not ported, skipped: {st['unsupported']})"
+        else:
+            note = "no modify/ patches (mergedmods not used on the modded side either)"
+        names = ", ".join(_load_mod_name(m, os.path.basename(m)) for m in base_roots)
+        print(f"baseline: vanilla + {names or 'nothing'}; {note}")
+        room_index = mapdiff.build_room_index(
+            [os.path.join(m, "world") for m in base_roots] +
+            [os.path.join(vanilla_root, "world")],
+            os.path.join(cache_dir, "room-index.pkl"))
+        print(f"baseline room fingerprints: {len(room_index['rooms'])}")
+        # Modded side: with --mod, bake the patches of the layers only (DLC +
+        # --mod + requirements). The game's mergedmods also carries every
+        # other enabled workshop mod's patches, which would be blamed on the
+        # --mod, and lacks the --mod's own patches when it's disabled.
+        mod_merged = merged_root
+        if merged_root and explicit_mod_roots:
+            mod_merged, st2 = mapdiff.build_baseline_merged(
+                mod_roots, vanilla_root, os.path.join(cache_dir, "mod-merged"))
+            print(f"modded side: modify/ patches of the layers above only "
+                  f"({st2['files']} files baked), not the game's mergedmods")
+        diff_cfg = {"base_roots": base_roots, "base_merged": base_merged,
+                    "mod_merged": mod_merged}
+    print()
+
+    if args.changes:
+        labels = list(campaigns) if campaigns else ["plain"]
+        work = [(diff_cfg, mod_roots, vanilla_root, merged_root, chain, r)
+                for chain, _d in targets for r in regions]
+        per_target = [[] for _ in targets]
+        errors = [[] for _ in targets]
+        with ProcessPoolExecutor(initializer=_init_worker,
+                                 initargs=(room_index,)) as ex:
+            for i, (region, d) in enumerate(ex.map(_diff_worker, work)):
+                if d and "error" in d:
+                    errors[i // len(regions)].append(f"{region}: {d['error']}")
+                    continue
+                per_target[i // len(regions)].append(d)
+        for label, diffs, errs in zip(labels, per_target, errors):
+            if len(labels) > 1 or campaigns:
+                print(f"== campaign: {label} ==")
+            print("\n".join(mapdiff.format_report(diffs)))
+            if errs:
+                print(f"  NOT COMPARED ({len(errs)} regions, errors):")
+                for e in errs:
+                    print(f"    {e}")
+            print()
+        if args.changes_json:
+            import json
+            with open(args.changes_json, "w", encoding="utf-8") as f:
+                json.dump({l: [d for d in ds if d] for l, ds in zip(labels, per_target)},
+                          f, indent=1, default=str)
+            print(f"json: {args.changes_json}")
+        return
 
     style = "outline" if args.outline else "filled"
     palette = PALETTES[style]
@@ -1954,10 +2211,12 @@ def main():
     work = [(mod_roots, vanilla_root, merged_root, chain,
              args.separate_layers, style,
              palette, optimize, args.fix_overlaps, args.optimize,
-             not args.no_title, args.title_font_size, r, out_dir)
+             not args.no_title, args.title_font_size, r, out_dir,
+             diff_cfg, args.only_changed, args.show_changed)
             for chain, out_dir in targets for r in regions]
     multi = len(targets) > 1
-    with ProcessPoolExecutor() as ex:
+    with ProcessPoolExecutor(initializer=_init_worker,
+                             initargs=(room_index,)) as ex:
         for w, (region, msg) in zip(work, ex.map(_worker, work)):
             prefix = f"{w[3][0]}/" if multi else ""
             print(f"[{prefix}{region:>4}] {msg}")
