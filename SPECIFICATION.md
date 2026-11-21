@@ -1,8 +1,8 @@
 # simple-mapper — Specification
 
 Formal reference for what the tool does and how. `README.md` is the user-facing
-usage guide; `CONVO.md` is the narrative design history; this document is the
-specification — what each part is for, its inputs/outputs, and its contracts.
+usage guide; this document is the specification — what each part is for, its
+inputs/outputs, and its contracts.
 
 ## 1. Purpose
 
@@ -251,5 +251,4 @@ guaranteed-crossing-free layout; all reduce, not eliminate, the problem.
 | `tests/test_resolution.py` | unittest: requirements, load order / EnabledMods, slugcat chains, Resolver lookup. `python -m unittest discover -s tests` |
 | `tests/test_campaign_map.py` | unittest: world-file room filtering, filling a campaign map from the plain map, closing campaign summary. |
 | `README.md` | User-facing usage guide. |
-| `CONVO.md` | Narrative design history (why decisions were made, in dialogue form). |
 | `SPECIFICATION.md` | This file — formal contract/reference. |
